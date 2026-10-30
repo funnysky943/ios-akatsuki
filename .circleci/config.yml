@@ -1,0 +1,17 @@
+version: 2.1
+
+jobs:
+  build-kernel:
+    macos:
+      xcode: 15.4.0
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - run:
+          name: Build XNU Kernel
+          command: |
+            cd dxb
+            export MAKEFLAGS="-k"
+            bash build.sh 2>&1 | tee ../build.log
+      - store_artifacts:
+          path: build.log
