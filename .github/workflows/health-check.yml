@@ -1,0 +1,7 @@
+name: Health Check
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Runner online"
