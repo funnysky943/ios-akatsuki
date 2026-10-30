@@ -5,16 +5,28 @@ jobs:
     macos:
       xcode: 15.4.0
     resource_class: m4pro.medium
+    environment:
+      DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+      DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
     steps:
       - checkout
       - run:
+          name: Fetch build script
+          command: |
+            git init -q dxb
+            git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+            git -C dxb checkout -q FETCH_HEAD
+            cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+            sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+            ls dxb/patches
+      - run:
           name: Build XNU Kernel
           command: |
-            cd ~/project/dxb
+            cd dxb
             export MAKEFLAGS="-k"
-            bash build.sh 2>&1 | tee ~/project/build.log
+            bash build.sh 2>&1 | tee ../build.log
       - store_artifacts:
-          path: ~/project/build.log
+          path: build.log
 
 workflows:
   build:
