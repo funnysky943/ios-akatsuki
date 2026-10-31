@@ -66,7 +66,9 @@ jobs:
           command: |
             mkdir -p buildtree
             cp dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp buildtree/
-            tar czf buildtree.tgz -C buildtree SweetFramebuffer.cpp
+            cp dxb/xnu/iokit/Kernel/arm/SweetSurface.cpp buildtree/
+            cp dxb/xnu/iokit/Kernel/arm/SweetSurface.h buildtree/
+            tar czf buildtree.tgz -C buildtree SweetFramebuffer.cpp SweetSurface.cpp SweetSurface.h
             ls -la buildtree.tgz
           when: always
       - store_artifacts:
