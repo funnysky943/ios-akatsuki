@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -214,6 +214,31 @@
+@@ -214,6 +214,45 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
@@ -25,6 +25,20 @@
 +                uint32_t rb0 = *(volatile uint32_t *)region;
 +                uint32_t rb1 = *(volatile uint32_t *)(region + 4);
 +                uint32_t rbMid = *(volatile uint32_t *)(region + (regionSize / 2));
++                /* Register readout: map MDP and read SSPP state */
++                volatile uint32_t *mdp = (volatile uint32_t *)ml_io_map(0xae00000, 0x100000);
++                if (mdp != NULL) {
++                        for (uint32_t i = 0; i < 0x100000 / 4; i++) {
++                                if (mdp[i] == 0x9d400000) {
++                                        IOLog("SWEET FB: SSPP found at 0x%x: SRC0_ADDR=0x9d400000\n", i * 4);
++                                        IOLog("SWEET FB: SRC_SIZE=0x%x SRC_YSTRIDE0=0x%x SRC_FORMAT=0x%x SRC_OP_MODE=0x%x\n",
++                                            mdp[i + 0x00], mdp[i + 0x24], mdp[i + 0x30], mdp[i + 0x38]);
++                                        break;
++                                }
++                        }
++                } else {
++                        IOLog("SWEET FB: mdp map failed\n");
++                }
 +                IOLog("SWEET FB: fill readback first=0x%08x second=0x%08x mid=0x%08x (expected 0x%08x)\n",
 +                    rb0, rb1, rbMid, fill);
 +                return true;
