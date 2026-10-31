@@ -1,33 +1,30 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -214,6 +214,32 @@
+@@ -214,6 +214,29 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
-+        /* Ruler pattern test: boot-arg sweetfb_pattern=1 */
++        /* Uniform fill test: boot-arg sweetfb_pattern=1 sweetfb_lane=N */
 +        int pattern = 0;
 +        PE_parse_boot_argn("sweetfb_pattern", &pattern, sizeof(pattern));
 +        if (pattern && fPixels) {
-+                uint32_t w = fWidth;
-+                uint32_t h = fHeight;
-+                uint8_t *fb = (uint8_t *)fPixels;
-+                for (uint32_t y = 0; y < h; y++) {
-+                        uint8_t *row = fb + (size_t)y * fRowBytes;
-+                        for (uint32_t x = 0; x < w; x++) {
-+                                uint8_t *p = row + (size_t)x * 4;
-+                                uint8_t l0 = 0, l1 = 0, l2 = 0, l3 = 0;
-+                                if (y < h / 5) { l0 = 0xFF; }
-+                                else if (y < 2 * h / 5) { l1 = 0xFF; }
-+                                else if (y < 3 * h / 5) { l2 = 0xFF; }
-+                                else if (y < 4 * h / 5) { l3 = 0xFF; }
-+                                else { l0 = l1 = l2 = l3 = 0xFF; }
-+                                if (x == 100 || x == 400 || x == 800 || x == 1200) {
-+                                        l0 = l1 = l2 = l3 = 0xFF;
-+                                }
-+                                p[0] = l0; p[1] = l1; p[2] = l2; p[3] = l3;
-+                        }
++                uint32_t lane = 4;  /* 4 = all lanes 0xFF */
++                PE_parse_boot_argn("sweetfb_lane", &lane, sizeof(lane));
++                uint8_t *region = (uint8_t *)fPixels;
++                size_t regionSize = 0x2400000;  /* whole splash region */
++                uint8_t val[4] = {0, 0, 0, 0};
++                if (lane < 4) {
++                        val[lane] = 0xFF;
++                } else {
++                        val[0] = val[1] = val[2] = val[3] = 0xFF;
 +                }
-+                IOLog("SWEET FB: pattern test written\n");
++                for (size_t i = 0; i < regionSize; i += 4) {
++                        region[i]     = val[0];
++                        region[i + 1] = val[1];
++                        region[i + 2] = val[2];
++                        region[i + 3] = val[3];
++                }
++                IOLog("SWEET FB: uniform fill lane %u written\n", lane);
 +                return true;
 +        }
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
