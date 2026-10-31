@@ -61,6 +61,17 @@ jobs:
             ls -la out
             (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
           when: always
+      - run:
+          name: Package patched framebuffer source
+          command: |
+            mkdir -p buildtree
+            cp dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp buildtree/
+            tar czf buildtree.tgz -C buildtree SweetFramebuffer.cpp
+            ls -la buildtree.tgz
+          when: always
+      - store_artifacts:
+          path: buildtree.tgz
+          when: always
       - store_artifacts:
           path: out/
           when: always
