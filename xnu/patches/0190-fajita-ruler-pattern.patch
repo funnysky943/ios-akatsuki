@@ -1,30 +1,26 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -214,6 +214,29 @@
+@@ -214,6 +214,25 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
-+        /* Uniform fill test: boot-arg sweetfb_pattern=1 sweetfb_lane=N */
++        /* Value fill test: boot-arg sweetfb_pattern=1 sweetfb_fill=0xRRGGBBAA */
 +        int pattern = 0;
 +        PE_parse_boot_argn("sweetfb_pattern", &pattern, sizeof(pattern));
 +        if (pattern && fPixels) {
-+                uint32_t lane = 4;  /* 4 = all lanes 0xFF */
-+                PE_parse_boot_argn("sweetfb_lane", &lane, sizeof(lane));
++                uint32_t fill = 0;
++                PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
++                sweet_console_muted = 1;  /* suppress kernel console drawing */
++                fDirty = false;           /* stop vsyncFired from copying over the fill */
 +                uint8_t *region = (uint8_t *)fPixels;
-+                size_t regionSize = 0x2400000;  /* whole splash region */
-+                uint8_t val[4] = {0, 0, 0, 0};
-+                if (lane < 4) {
-+                        val[lane] = 0xFF;
-+                } else {
-+                        val[0] = val[1] = val[2] = val[3] = 0xFF;
-+                }
++                size_t regionSize = 0x2400000;
 +                for (size_t i = 0; i < regionSize; i += 4) {
-+                        region[i]     = val[0];
-+                        region[i + 1] = val[1];
-+                        region[i + 2] = val[2];
-+                        region[i + 3] = val[3];
++                        region[i]     = (uint8_t)(fill & 0xFF);
++                        region[i + 1] = (uint8_t)((fill >> 8) & 0xFF);
++                        region[i + 2] = (uint8_t)((fill >> 16) & 0xFF);
++                        region[i + 3] = (uint8_t)((fill >> 24) & 0xFF);
 +                }
-+                IOLog("SWEET FB: uniform fill lane %u written\n", lane);
++                IOLog("SWEET FB: value fill 0x%08x written\n", fill);
 +                return true;
 +        }
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
