@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -214,6 +214,50 @@
+@@ -214,6 +214,54 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
@@ -25,6 +25,9 @@
 +                uint32_t rb0 = *(volatile uint32_t *)region;
 +                uint32_t rb1 = *(volatile uint32_t *)(region + 4);
 +                uint32_t rbMid = *(volatile uint32_t *)(region + (regionSize / 2));
++                int noreg = 0;
++                PE_parse_boot_argn("sweetfb_noregdump", &noreg, sizeof(noreg));
++                if (!noreg) {
 +                /* Register readout: map MDP and read SSPP state */
 +                IOMemoryDescriptor *mdpDesc = IOMemoryDescriptor::withPhysicalAddress(
 +                    (IOPhysicalAddress)0xae00000, 0x100000, kIODirectionNone);
@@ -44,6 +47,7 @@
 +                }
 +                if (mdpMap) mdpMap->release();
 +                if (mdpDesc) mdpDesc->release();
++                }  /* end if (!noreg) */
 +                IOLog("SWEET FB: fill readback first=0x%08x second=0x%08x mid=0x%08x (expected 0x%08x)\n",
 +                    rb0, rb1, rbMid, fill);
 +                return true;
