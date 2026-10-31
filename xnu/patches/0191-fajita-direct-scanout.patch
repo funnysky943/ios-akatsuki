@@ -8,3 +8,12 @@
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
  #include <IOKit/IOLib.h>
+@@ -245,6 +246,8 @@
+ 		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
++        } else {
++                IOLog("SWEET FB: VIG0/CTL0 map failed (fVig0=%p fCtl0=%p)\n", fVig0, fCtl0);
+ 	}
+         }
+ 	uint32_t hz = 10;
