@@ -1,6 +1,14 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -214,6 +214,45 @@
+@@ -48,6 +48,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#include <kern/machine_routines.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+@@ -214,6 +215,45 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
