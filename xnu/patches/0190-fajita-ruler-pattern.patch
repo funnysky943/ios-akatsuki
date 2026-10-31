@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -214,6 +214,25 @@
+@@ -214,6 +214,31 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
@@ -21,6 +21,12 @@
 +                        region[i + 3] = (uint8_t)((fill >> 24) & 0xFF);
 +                }
 +                IOLog("SWEET FB: value fill 0x%08x written\n", fill);
++                /* Readback: verify the fill reached the mapping */
++                uint32_t rb0 = *(volatile uint32_t *)region;
++                uint32_t rb1 = *(volatile uint32_t *)(region + 4);
++                uint32_t rbMid = *(volatile uint32_t *)(region + (regionSize / 2));
++                IOLog("SWEET FB: fill readback first=0x%08x second=0x%08x mid=0x%08x (expected 0x%08x)\n",
++                    rb0, rb1, rbMid, fill);
 +                return true;
 +        }
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
