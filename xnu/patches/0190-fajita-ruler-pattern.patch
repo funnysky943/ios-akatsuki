@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -214,6 +214,54 @@
+@@ -214,6 +214,78 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
@@ -29,24 +29,48 @@
 +                PE_parse_boot_argn("sweetfb_noregdump", &noreg, sizeof(noreg));
 +                if (!noreg) {
 +                /* Register readout: map MDP and read SSPP state */
-+                IOMemoryDescriptor *mdpDesc = IOMemoryDescriptor::withPhysicalAddress(
-+                    (IOPhysicalAddress)0xae00000, 0x100000, kIODirectionNone);
-+                IOMemoryMap *mdpMap = mdpDesc ? mdpDesc->map(kIOMapInhibitCache) : NULL;
-+                volatile uint32_t *mdp = mdpMap ? (volatile uint32_t *)mdpMap->getVirtualAddress() : NULL;
-+                if (mdp != NULL) {
-+                        for (uint32_t i = 0; i < 0x100000 / 4; i++) {
-+                                if (mdp[i] == 0x9d400000) {
-+                                        IOLog("SWEET FB: SSPP found at 0x%x: SRC0_ADDR=0x9d400000\n", i * 4);
-+                                        IOLog("SWEET FB: SRC_SIZE=0x%x SRC_YSTRIDE0=0x%x SRC_FORMAT=0x%x SRC_OP_MODE=0x%x\n",
-+                                            mdp[i + 0x00], mdp[i + 0x24], mdp[i + 0x30], mdp[i + 0x38]);
-+                                        break;
-+                                }
++                IOLog("SWEET FB: ladder 1: GCC display branches\n");
++                IOMemoryDescriptor *gccDesc = IOMemoryDescriptor::withPhysicalAddress(
++                    (IOPhysicalAddress)0x100000, 0x10000, kIODirectionNone);
++                IOMemoryMap *gccMap = gccDesc ? gccDesc->map(kIOMapInhibitCache) : NULL;
++                volatile uint32_t *gcc = gccMap ? (volatile uint32_t *)gccMap->getVirtualAddress() : NULL;
++                if (gcc) {
++                        for (uint32_t off = 0xb000; off < 0xc000; off += 0x1000) {
++                                IOLog("SWEET FB: GCC+0x%x = 0x%08x (CLK_OFF=%u)\n",
++                                    off, gcc[off/4], (gcc[off/4] >> 31) & 1);
 +                        }
 +                } else {
-+                        IOLog("SWEET FB: mdp map failed\n");
++                        IOLog("SWEET FB: GCC map failed\n");
 +                }
-+                if (mdpMap) mdpMap->release();
-+                if (mdpDesc) mdpDesc->release();
++                if (gccMap) gccMap->release();
++                if (gccDesc) gccDesc->release();
++
++                IOLog("SWEET FB: ladder 2: DISPCC GDSC\n");
++                IOMemoryDescriptor *dispDesc = IOMemoryDescriptor::withPhysicalAddress(
++                    (IOPhysicalAddress)0xaf00000, 0x10000, kIODirectionNone);
++                IOMemoryMap *dispMap = dispDesc ? dispDesc->map(kIOMapInhibitCache) : NULL;
++                volatile uint32_t *disp = dispMap ? (volatile uint32_t *)dispMap->getVirtualAddress() : NULL;
++                if (disp) {
++                        IOLog("SWEET FB: DISPCC+0x3000 = 0x%08x (PWR_ON=%u)\n",
++                            disp[0x3000/4], (disp[0x3000/4] >> 31) & 1);
++                } else {
++                        IOLog("SWEET FB: DISPCC map failed\n");
++                }
++                if (dispMap) dispMap->release();
++                if (dispDesc) dispDesc->release();
++
++                IOLog("SWEET FB: ladder 3: MDSS version\n");
++                IOMemoryDescriptor *mdssDesc = IOMemoryDescriptor::withPhysicalAddress(
++                    (IOPhysicalAddress)0xae00000, 0x1000, kIODirectionNone);
++                IOMemoryMap *mdssMap = mdssDesc ? mdssDesc->map(kIOMapInhibitCache) : NULL;
++                volatile uint32_t *mdss = mdssMap ? (volatile uint32_t *)mdssMap->getVirtualAddress() : NULL;
++                if (mdss) {
++                        IOLog("SWEET FB: MDSS version = 0x%08x\n", mdss[0]);
++                } else {
++                        IOLog("SWEET FB: MDSS map failed\n");
++                }
++                if (mdssMap) mdssMap->release();
++                if (mdssDesc) mdssDesc->release();
 +                }  /* end if (!noreg) */
 +                IOLog("SWEET FB: fill readback first=0x%08x second=0x%08x mid=0x%08x (expected 0x%08x)\n",
 +                    rb0, rb1, rbMid, fill);
