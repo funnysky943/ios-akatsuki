@@ -4,7 +4,7 @@
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/system.h>
  #include <pexpert/pexpert.h>
-+#include <kern/machine_routines.h>
++#include <arm/machine_routines.h>
  #include <kern/clock.h>
  #include <sys/proc.h>
  
