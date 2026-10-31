@@ -1,14 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -48,6 +48,7 @@
- #include <IOKit/IOTimerEventSource.h>
- #include <IOKit/system.h>
- #include <pexpert/pexpert.h>
-+#include <arm/machine_routines.h>
- #include <kern/clock.h>
- #include <sys/proc.h>
- 
-@@ -214,6 +215,45 @@
+@@ -214,6 +214,50 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
@@ -34,7 +26,10 @@
 +                uint32_t rb1 = *(volatile uint32_t *)(region + 4);
 +                uint32_t rbMid = *(volatile uint32_t *)(region + (regionSize / 2));
 +                /* Register readout: map MDP and read SSPP state */
-+                volatile uint32_t *mdp = (volatile uint32_t *)ml_io_map(0xae00000, 0x100000);
++                IOMemoryDescriptor *mdpDesc = IOMemoryDescriptor::withPhysicalAddress(
++                    (IOPhysicalAddress)0xae00000, 0x100000, kIODirectionNone);
++                IOMemoryMap *mdpMap = mdpDesc ? mdpDesc->map(kIOMapInhibitCache) : NULL;
++                volatile uint32_t *mdp = mdpMap ? (volatile uint32_t *)mdpMap->getVirtualAddress() : NULL;
 +                if (mdp != NULL) {
 +                        for (uint32_t i = 0; i < 0x100000 / 4; i++) {
 +                                if (mdp[i] == 0x9d400000) {
@@ -47,6 +42,8 @@
 +                } else {
 +                        IOLog("SWEET FB: mdp map failed\n");
 +                }
++                if (mdpMap) mdpMap->release();
++                if (mdpDesc) mdpDesc->release();
 +                IOLog("SWEET FB: fill readback first=0x%08x second=0x%08x mid=0x%08x (expected 0x%08x)\n",
 +                    rb0, rb1, rbMid, fill);
 +                return true;
