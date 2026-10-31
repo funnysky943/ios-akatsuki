@@ -80,11 +80,10 @@
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
  		if (step <= 6) {
-@@ -354,10 +402,82 @@
+@@ -354,10 +402,81 @@
  }
  
  void
-+void
 +AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
 +{
 +	fVig0[0x14 / 4] = (uint32_t)pa;
