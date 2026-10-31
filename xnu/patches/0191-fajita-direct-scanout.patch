@@ -1,0 +1,159 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,8 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);  /* osfmk/arm/caches.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -113,6 +115,14 @@
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
++	volatile uint32_t *fVig0;
++	volatile uint32_t *fCtl0;
++	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
++	uint32_t      fScanStride;
++	uint32_t      fBootSrc, fBootStride;
++	bool          directPresent(const uint8_t *rec);
++	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -204,7 +214,39 @@
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
++        }
++        /* Skip direct scanout if the scanout pool collides with the secure display region */
++        bool scanoutSafe = true;
++        {
++                IORegistryEntry *secure = IORegistryEntry::fromPath("/reserved-memory/secure_display_region", gIODTPlane);
++                if (secure != NULL) {
++                        OSData *reg = OSDynamicCast(OSData, secure->getProperty("reg"));
++                        if (reg != NULL && reg->getLength() == 16) {
++                                const uint32_t *cells = (const uint32_t *)reg->getBytesNoCopy();
++                                uint64_t sBase = ((uint64_t)cells[0] << 32) | cells[1];
++                                uint64_t sSize = ((uint64_t)cells[2] << 32) | cells[3];
++                                if (0xa8000000ull >= sBase && 0xa8000000ull < sBase + sSize) {
++                                        scanoutSafe = false;
++                                        IOLog("SWEET FB: scanout pool 0xa8000000 collides with secure display 0x%llx+0x%llx, direct scanout disabled\n",
++                                            sBase, sSize);
++                                }
++                        }
++                        secure->release();
++                }
++        }
++        if (scanoutSafe) {
++	fVig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
++	fCtl0 = (volatile uint32_t *)ml_io_map(0xae01000, 0x1000);
++	if (fVig0 != NULL && fCtl0 != NULL) {
++		fBootSrc = fVig0[0x14 / 4];
++		fBootStride = fVig0[0x24 / 4];
++		fScanPhys = fBootSrc;
++		fScanStride = fBootStride;
++		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
++		    fBootSrc, fBootStride);
++		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 	}
++        }
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -270,6 +312,9 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
++		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
++			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
++		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -354,10 +399,82 @@
+ }
+ 
+ void
++void
++AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
++{
++	fVig0[0x14 / 4] = (uint32_t)pa;
++	fVig0[0x24 / 4] = stride;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
++	__asm__ volatile("dsb sy" ::: "memory");
++	fScanPhys = pa;
++	fScanStride = stride;
++}
++
++/*
++ * topaz: a swap that shows one full-screen surface from the scanout pool is
++ * presented by pointing the MDP at it (no 10 MB CPU copy). Returns false to
++ * fall back to the copy path.
++ */
++bool
++AppleCLCD::directPresent(const uint8_t *rec)
++{
++	if (fVig0 == NULL) {
++		return false;
++	}
++	uint32_t mask = get32(rec, 0x104), layer = 32, n = 0;
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			layer = i;
++			n++;
++		}
++	}
++	if (n != 1) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	if (s == NULL) {
++		return false;
++	}
++	bool ok = false;
++	if (s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
++	    s->width >= fWidth && s->height >= fHeight) {
++		/* full-screen surface: panel window at the logical offset */
++		uint32_t ox = (s->width - fWidth) / 2, oy = (s->height - fHeight) / 2;
++		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
++		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
++			uintptr_t va = s->kernelAddress();
++			if (va != 0) {
++				/* the MDP does not snoop CPU caches */
++				flush_dcache64((addr64_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow),
++				    (unsigned)((uint64_t)fHeight * s->bytesPerRow), FALSE);
++				scanFrom(pa, s->bytesPerRow);
++				ok = true;
++			}
++		}
++	}
++	s->release();
++	return ok;
++}
++
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++        if (directPresent(rec)) {
++                if (!fConsolePaused) {
++                        int quiet = 0;
++                        fConsolePaused = true;
++                        if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++                                sweet_console_muted = 1;
++                        }
++                }
++                return;
++        }
++        /* copy path: make sure the MDP shows the boot framebuffer we copy into */
++        if (fVig0 != NULL && fScanPhys != fBootSrc) {
++                scanFrom(fBootSrc, fBootStride);
++        }
+ 	static int console_only = -1;
+ 	/*
+ 	 * boot-arg sweetfb_console=1: bring-up only. Copying a GUI surface into the
