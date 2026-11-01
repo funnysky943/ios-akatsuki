@@ -15,10 +15,10 @@
 +#define XZ3_GCC_VOTE     0x5200cu       /* hlos1 vote enable (both wrappers) */
 +#define XZ3_VOTE_BITS    ((1u << 6) | (1u << 7) | (1u << 15) | (1u << 16))
 +                                         /* M_AHB | S_AHB | SE5 | SE6 */
-+#define XZ3_SE5_CBCR     0x17094u       /* wrap0 SE5 branch, bit31 = CLK_OFF */
-+#define XZ3_SE5_CMD      0x17098u       /* wrap0 SE5 CMD_RCGR */
-+#define XZ3_SE5_CFG      0x1709cu       /* wrap0 SE5 CFG_RCGR */
-+#define XZ3_SE5_CBCR_ALT 0x17738u       /* Bergamota-style candidate, probe only */
++#define XZ3_SE5_CBCR     0x17738u       /* wrap0 SE5 branch (Bergamota offsets) */
++#define XZ3_SE5_CMD      0x1773cu       /* wrap0 SE5 CMD_RCGR */
++#define XZ3_SE5_CFG      0x17740u       /* wrap0 SE5 CFG_RCGR */
++#define XZ3_SE5_CBCR_ALT 0x17094u       /* mainline candidate, probe only */
 +#define XZ3_TLMM_BASE    0x03400000u    /* single tile, 12 MiB, stride 0x1000 */
 +#define XZ3_TLMM_SIZE    0xc00000u
 +#define XZ3_SE_PA        0x0894000u     /* i2c@894000, wrap0 SE5 */
@@ -69,7 +69,7 @@
  }
  
  static bool
-@@ -545,6 +567,148 @@
+@@ -545,6 +567,156 @@
  	return true;
  }
  
@@ -89,7 +89,10 @@
 +xz3_clocks(void)
 +{
 +	touch_wr(st.gcc, XZ3_GCC_VOTE, touch_rd(st.gcc, XZ3_GCC_VOTE) | XZ3_VOTE_BITS);
-+	printf("SWEET TS: xz3 vote=%#x\n", touch_rd(st.gcc, XZ3_GCC_VOTE));
++	printf("SWEET TS: xz3 vote=%#x cbcr main=%#x alt=%#x\n",
++	    touch_rd(st.gcc, XZ3_GCC_VOTE),
++	    touch_rd(st.gcc, XZ3_SE5_CBCR),
++	    touch_rd(st.gcc, XZ3_SE5_CBCR_ALT));
 +
 +	uint32_t cfg = touch_rd(st.gcc, XZ3_SE5_CFG);
 +	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;   /* SRC=bi_tcxo, DIV=1 */
@@ -191,14 +194,19 @@
 +	if (!xz3_clocks()) {
 +		goto out;
 +	}
++	printf("SWEET TS: calling touch_se_init\n");
 +	if (!touch_se_init()) {
++		printf("SWEET TS: touch_se_init failed\n");
 +		goto out;
 +	}
++	printf("SWEET TS: touch_se_init OK\n");
 +
 +	/* --- first milestone: info block only ------------------------------- */
++	printf("SWEET TS: calling mxt_probe\n");
 +	st.probing = true;
 +	bool ok = mxt_probe();
 +	st.probing = false;
++	printf("SWEET TS: mxt_probe returned %d\n", ok ? 1 : 0);
 +	if (!ok) {
 +		goto out;
 +	}
@@ -218,7 +226,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +814,17 @@
+@@ -650,7 +822,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
