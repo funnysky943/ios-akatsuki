@@ -1,0 +1,240 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -29,6 +29,28 @@
+ #define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
++
++/*
++ * akatsuki (Sony Xperia XZ3, SDM845): Atmel mXT640U at I2C 0x4a on QUPv3
++ * SE5 (i2c@894000, wrapper 0), ATTN gpio125, reset gpio99, VDDIO enable
++ * gpio133 (all on the single 12 MiB TLMM tile at 0x03400000), VDD on
++ * PM8998 LDO28 (3.008 V). Select with boot-arg sweetts=2.
++ */
++#define XZ3_GCC_PA       0x00100000u
++#define XZ3_GCC_VOTE     0x5200cu       /* hlos1 vote enable (both wrappers) */
++#define XZ3_VOTE_BITS    ((1u << 6) | (1u << 7) | (1u << 15) | (1u << 16))
++                                         /* M_AHB | S_AHB | SE5 | SE6 */
++#define XZ3_SE5_CBCR     0x17094u       /* wrap0 SE5 branch, bit31 = CLK_OFF */
++#define XZ3_SE5_CMD      0x17098u       /* wrap0 SE5 CMD_RCGR */
++#define XZ3_SE5_CFG      0x1709cu       /* wrap0 SE5 CFG_RCGR */
++#define XZ3_SE5_CBCR_ALT 0x17738u       /* Bergamota-style candidate, probe only */
++#define XZ3_TLMM_BASE    0x03400000u    /* single tile, 12 MiB, stride 0x1000 */
++#define XZ3_TLMM_SIZE    0xc00000u
++#define XZ3_SE_PA        0x0894000u     /* i2c@894000, wrap0 SE5 */
++#define XZ3_TS_ADDR      0x4au          /* Atmel mXT640U */
++#define XZ3_GPIO_ATTN    125u
++#define XZ3_GPIO_RESET   99u
++#define XZ3_GPIO_VIO     133u
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
+@@ -72,7 +92,7 @@
+ #define SE_PACK1        0x000ffefeu
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
++	vm_offset_t se, gcc, gpio, gpio_s;     /* gpio_s aliases gpio (single TLMM tile) */
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -119,18 +139,25 @@
+ }
+ 
+ static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++touch_gpio_at(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
+ {
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
++	uint32_t cfg = touch_rd(base, off);
+ 	if (out) {
+ 		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		touch_wr(base, TOUCH_GPIO_IO(pin),
++		    (touch_rd(base, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(base, off, cfg);
++}
++
++static void
++touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	touch_gpio_at(st.gpio, pin, mux, pull, drive, out, high);
+ }
+ 
+ static bool
+@@ -545,6 +567,149 @@
+ 	return true;
+ }
+ 
++/* -------------------------------------------------------------- akatsuki */
++
++/*
++ * Clock enable for QUPv3 wrapper 0 SE5.
++ *
++ * 0x5200c is the GCC hlos1 vote register; bits 6/7 are M_AHB / S_AHB and
++ * bits 15/16 vote the per-SE branches. The wrapper 0 SE5 branch lives at
++ * 0x17094 per mainline gcc-sdm845.c (SE0 at 0x1701c, stride 0x18);
++ * Bergamota's BT UART patch instead names 0x17738 for SE5 (0x17750 for
++ * SE6), so both are read back and logged. Whichever clears bit 31 is the
++ * live one.
++ */
++static bool
++xz3_clocks(void)
++{
++	touch_wr(st.gcc, XZ3_GCC_VOTE, touch_rd(st.gcc, XZ3_GCC_VOTE) | XZ3_VOTE_BITS);
++	printf("SWEET TS: xz3 vote=%#x\n", touch_rd(st.gcc, XZ3_GCC_VOTE));
++
++	uint32_t cfg = touch_rd(st.gcc, XZ3_SE5_CFG);
++	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;   /* SRC=bi_tcxo, DIV=1 */
++	touch_wr(st.gcc, XZ3_SE5_CFG, cfg);
++	touch_wr(st.gcc, XZ3_SE5_CMD, touch_rd(st.gcc, XZ3_SE5_CMD) | 0x3u);  /* ROOT_EN|UPDATE */
++	if (!touch_wait_clear(st.gcc, XZ3_SE5_CMD, 1u)) {
++		printf("SWEET TS: RCG update timeout (cmd=%#x cfg=%#x)\n",
++		    touch_rd(st.gcc, XZ3_SE5_CMD), touch_rd(st.gcc, XZ3_SE5_CFG));
++		return false;
++	}
++
++	bool ok = false;
++	for (unsigned i = 0; i < 200; ++i) {
++		uint32_t v = touch_rd(st.gcc, XZ3_SE5_CBCR);
++		if (!(v & (1u << 31))) {
++			printf("SWEET TS: SE5 clock running (cbcr=%#x)\n", v);
++			ok = true;
++			break;
++		}
++		touch_wait(1);
++	}
++	if (!ok) {
++		uint32_t v = touch_rd(st.gcc, XZ3_SE5_CBCR);
++		uint32_t a = touch_rd(st.gcc, XZ3_SE5_CBCR_ALT);
++		printf("SWEET TS: SE5 clock still halted cbcr=%#x alt=%#x\n", v, a);
++		if (!(a & (1u << 31))) {
++			printf("SWEET TS: alt cbcr live, mainline offset may be wrong\n");
++		}
++		return false;
++	}
++	return true;
++}
++
++/*
++ * Atmel maXTouch info block: 7 bytes at address 0x0000 on the 16-bit
++ * register space. Reads use the same touch_msg() primitive as fajita; the
++ * address is transmitted as a two-byte little-endian prefix, which is what
++ * the mXT family expects on I2C.
++ */
++static int
++mxt_read(uint16_t reg, uint8_t *buf, unsigned len)
++{
++	uint8_t addr[2] = { (uint8_t)(reg & 0xffu), (uint8_t)(reg >> 8) };
++	return touch_msg(XZ3_TS_ADDR, addr, 2, buf, len, true);
++}
++
++static bool
++mxt_probe(void)
++{
++	uint8_t ib[7] = {0};
++	int err = mxt_read(0x0000, ib, sizeof(ib));
++	if (err != 0) {
++		printf("SWEET MXT: info block read failed err=%d irq=%#x\n",
++		    err, st.irq_status);
++		return false;
++	}
++	printf("SWEET MXT: info family=%#x variant=%#x version=%#x build=%#x"
++	    " matrix=%ux%u objects=%u\n",
++	    ib[0], ib[1], ib[2], ib[3], ib[4], ib[5], ib[6]);
++	if (ib[0] == 0 && ib[6] == 0) {
++		printf("SWEET MXT: info block reads as all-zero, chip not answering\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++touch_xz3_thread(__unused void *arg, __unused wait_result_t result)
++{
++	unsigned delay_s = 20;
++
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET TS: akatsuki mXT640U, starting in %u s\n", delay_s);
++	touch_wait(delay_s * 1000u);
++
++	st.gcc = ml_io_map(XZ3_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(XZ3_TLMM_BASE, XZ3_TLMM_SIZE);
++	st.gpio_s = st.gpio;              /* single tile */
++	st.se = ml_io_map(XZ3_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.se) {
++		printf("SWEET TS: MMIO mapping failed\n");
++		goto out;
++	}
++
++	/* VDD (AVDD) on PM8998 LDO28 at 3.008 V; VDDIO via gpio133. */
++	int perr = sweet_rpmh_vreg_enable("ldoa28", 3008);
++	printf("SWEET TS: ldoa28 vote -> %d\n", perr);
++
++	/* VDDIO (133) high, ATTN (125) as pull-up input, RESET (99) high, then
++	 * low pulse, then release. Delays per the panel node: 0/1/1 ms. */
++	touch_gpio_at(st.gpio, XZ3_GPIO_VIO, 0, 0, 1, true, true);
++	touch_gpio_at(st.gpio, XZ3_GPIO_ATTN, 0, 3, 3, false, false);
++	touch_gpio_at(st.gpio, XZ3_GPIO_RESET, 0, 3, 2, true, true);
++	touch_wait(1);
++	touch_gpio_at(st.gpio, XZ3_GPIO_RESET, 0, 3, 2, true, false);
++	touch_wait(1);
++	touch_gpio_at(st.gpio, XZ3_GPIO_RESET, 0, 3, 2, true, true);
++	touch_wait(200);   /* chip boot */
++
++	if (!xz3_clocks()) {
++		goto out;
++	}
++	if (!touch_se_init()) {
++		goto out;
++	}
++
++	/* --- first milestone: info block only ------------------------------- */
++	st.probing = true;
++	bool ok = mxt_probe();
++	st.probing = false;
++	if (!ok) {
++		goto out;
++	}
++	printf("SWEET MXT: probe OK, Patch B will parse the object table\n");
++
++	/* Keep the thread alive so we can re-probe from the log after boot. */
++	for (unsigned i = 0; i < 120 && !st.dead; ++i) {
++		touch_wait(1000);
++		(void)mxt_probe();
++	}
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -650,7 +815,17 @@
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
+-	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
++	int ts_mode = 0;
++	(void)PE_parse_boot_argn("sweetts", &ts_mode, sizeof(ts_mode));
++	void (*start)(void *, wait_result_t) = touch_thread;
++	if (ts_mode == 1) {
++		printf("SWEET TS: fajita RMI4 selected (sweetts=1)\n");
++		/* fajita path disabled; see 0090-fajita-touch-rmi4.patch.disabled */
++	} else if (ts_mode == 2) {
++		printf("SWEET TS: akatsuki mXT640U selected (sweetts=2)\n");
++		start = touch_xz3_thread;
++	}
++	kern_return_t kr = kernel_thread_start(start, NULL, &thread);
+ 	if (kr != KERN_SUCCESS) {
+ 		printf("SWEET TOUCH: thread start failed %d\n", kr);
+ 		return;
