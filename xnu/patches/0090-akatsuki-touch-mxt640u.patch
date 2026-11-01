@@ -69,7 +69,7 @@
  }
  
  static bool
-@@ -545,6 +567,164 @@
+@@ -545,6 +567,179 @@
  	return true;
  }
  
@@ -202,6 +202,21 @@
 +	if (!xz3_clocks()) {
 +		goto out;
 +	}
++	/* SE5 pinmux: SDA=gpio85, SCL=gpio86, function qup5 (=1), 2 mA, no pull. */
++	/* First, set to GPIO input and read idle levels to rule out a stuck bus. */
++	touch_gpio_at(st.gpio, 85, 0, 0, 0, false, false);
++	touch_gpio_at(st.gpio, 86, 0, 0, 0, false, false);
++	touch_wait(1);
++	printf("SWEET TS: SE5 idle SDA=%d SCL=%d\n",
++	    (touch_rd(st.gpio, TOUCH_GPIO_IO(85)) & 2u) ? 1 : 0,
++	    (touch_rd(st.gpio, TOUCH_GPIO_IO(86)) & 2u) ? 1 : 0);
++	/* Mux to QUP function. */
++	touch_gpio_at(st.gpio, 85, 1, 0, 0, false, false);
++	touch_gpio_at(st.gpio, 86, 1, 0, 0, false, false);
++	printf("SWEET TS: SE5 muxed cfg85=%#x cfg86=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(85)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(86)));
++
 +	printf("SWEET TS: calling touch_se_init\n");
 +	if (!touch_se_init()) {
 +		printf("SWEET TS: touch_se_init failed\n");
@@ -234,7 +249,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +830,17 @@
+@@ -650,7 +845,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
