@@ -235,6 +235,6 @@
 +		start = touch_xz3_thread;
 +	}
 +	kern_return_t kr = kernel_thread_start(start, NULL, &thread);
- 	if (kr != KERN_SUCCESS) {
- 		printf("SWEET TOUCH: thread start failed %d\n", kr);
- 		return;
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
