@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -29,6 +29,28 @@
+@@ -29,6 +29,30 @@
  #define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
  #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
  #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
@@ -20,6 +20,8 @@
 +#define XZ3_SE5_CFG      0x17740u       /* wrap0 SE5 CFG_RCGR */
 +#define XZ3_SE5_CBCR_ALT 0x17094u       /* mainline candidate, probe only */
 +#define XZ3_TLMM_BASE    0x03400000u    /* single tile, 12 MiB, stride 0x1000 */
++#define XZ3_TLMM_WEST_OFS  0x100000u   /* WEST  = 0x03500000 */
++#define XZ3_TLMM_NORTH_OFS 0x500000u   /* NORTH = 0x03900000 */
 +#define XZ3_TLMM_SIZE    0xc00000u
 +#define XZ3_SE_PA        0x0894000u     /* i2c@894000, wrap0 SE5 */
 +#define XZ3_TS_ADDR      0x4au          /* Atmel mXT640U */
@@ -29,7 +31,7 @@
  #define TOUCH_MAX        10u
  #define TOUCH_GOODIX     1
  #define TOUCH_FTS        2
-@@ -72,7 +92,7 @@
+@@ -72,7 +94,7 @@
  #define SE_PACK1        0x000ffefeu
  
  static struct {
@@ -38,7 +40,7 @@
  	bool started, dead, probing;
  	int kind, irq_hint;
  	uint32_t irq_status, irq_last, active;
-@@ -119,18 +139,25 @@
+@@ -119,18 +141,25 @@
  }
  
  static void
@@ -69,7 +71,7 @@
  }
  
  static bool
-@@ -545,6 +567,194 @@
+@@ -545,6 +569,194 @@
  	return true;
  }
  
@@ -264,7 +266,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +860,17 @@
+@@ -650,7 +862,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
