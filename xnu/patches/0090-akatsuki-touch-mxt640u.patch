@@ -71,7 +71,7 @@
  }
  
  static bool
-@@ -545,6 +569,408 @@
+@@ -545,6 +569,492 @@
  	return true;
  }
  
@@ -207,13 +207,19 @@
 +};
 +static struct mxt_object mxt_objs[MXT_MAX_OBJECTS];
 +static uint8_t  mxt_nobjs;
-+static uint8_t  mxt_t5_addr, mxt_t5_size;
-+static uint8_t  mxt_t6_addr, mxt_t6_size;
-+static uint8_t  mxt_t7_addr;
-+static uint8_t  mxt_t44_addr;
-+static uint8_t  mxt_t100_addr, mxt_t100_size;
++/* Object addresses and sizes are 16-bit. Using uint8_t truncated
++ * T5@0x17d to 0x7d etc. and would wrap size_minus_one 255 + 1 to 0. */
++static uint16_t mxt_t5_addr, mxt_t6_addr, mxt_t7_addr;
++static uint16_t mxt_t44_addr, mxt_t100_addr;
++static uint16_t mxt_t5_size, mxt_t6_size, mxt_t100_size;
 +static uint8_t  mxt_t100_minid;
 +static uint8_t  mxt_next_report_id;
++/* T100 contact slot tracking (16 contact slots per num_report_ids - 2) */
++static struct {
++	uint16_t x, y;
++	uint8_t  status;
++	bool     active;
++} mxt_slots[16];
 +
 +static bool
 +mxt_probe(void)
@@ -347,40 +353,85 @@
 +		}
 +	}
 +
-+	/* --- ATTN pad level + drain pending T5 messages ---------------- */
-+	unsigned attn_before = (touch_rd(st.gpio + XZ3_TLMM_WEST_OFS,
-+	    TOUCH_GPIO_IO(XZ3_GPIO_ATTN)) & 1u) ? 1u : 0u;
-+	unsigned msg_size = (mxt_t5_size > 1u) ? (mxt_t5_size - 1u) : 0u;
++	printf("SWEET MXT: init complete, entering 10 ms poll loop\n");
++	return true;
++}
++
++/* ---------------------------------------------------------------------
++ * T44-based message drain. Read count + first message in one 11-byte
++ * read (T44 count at T44.addr, T5 messages immediately after), then
++ * drain remaining count-1 messages one at a time. Whole messages only;
++ * T5 is a FIFO, so never split a message across transactions.
++ * Decode T100 contact messages (id in [minid..maxid]) into mxt_slots.
++ * ------------------------------------------------------------------- */
++static int
++mxt_drain_msgs(unsigned *out_drained, unsigned id_counts[64])
++{
++	if (!mxt_t44_addr || !mxt_t5_addr || mxt_t5_size <= 1) {
++		return -1;
++	}
++	unsigned msg_size = (unsigned)(mxt_t5_size - 1u);
++	if (msg_size > 16u) {
++		msg_size = 16u;
++	}
++
++	/* Read T44 count + first message (count byte + msg_size bytes). */
++	uint8_t buf[17] = {0};
++	unsigned total = 1u + msg_size;
++	if (mxt_read_chunked(mxt_t44_addr, buf, total) != 0) {
++		return -1;
++	}
++	unsigned count = buf[0];
++	if (count > 32u) {
++		count = 32u;
++	}
 +	unsigned drained = 0;
-+	unsigned logged = 0;
-+	if (msg_size > 0 && msg_size <= 16u) {
-+		for (unsigned k = 0; k < 32u; ++k) {
-+			uint8_t m[16] = {0};
++	for (unsigned k = 0; k < count; ++k) {
++		uint8_t m[16] = {0};
++		if (k == 0) {
++			for (unsigned b = 0; b < msg_size && b + 1 < total; ++b) {
++				m[b] = buf[1u + b];
++			}
++		} else {
 +			if (mxt_read_chunked(mxt_t5_addr, m, msg_size) != 0) {
 +				break;
 +			}
-+			if (m[0] == 0xFFu) {
-+				break;
-+			}
-+			++drained;
-+			if (logged < 5) {
-+				unsigned nshow = msg_size < 8u ? msg_size : 8u;
-+				printf("SWEET MXT: msg id=%u", m[0]);
-+				for (unsigned b = 1; b < nshow; ++b) {
-+					printf(" %02x", m[b]);
++		}
++		uint8_t id = m[0];
++		if (id == 0xFFu || id == 0u) {
++			break;
++		}
++		if (id < 64u) {
++			++id_counts[id];
++		}
++		++drained;
++
++		/* T100 contact message (id in [minid..maxid], contact = id - minid - 2). */
++		if (id >= mxt_t100_minid && mxt_t100_size >= 6u) {
++			int contact_id = (int)id - (int)mxt_t100_minid - 2;
++			if (contact_id >= 0 && contact_id < 16) {
++				uint8_t status = m[1];
++				uint16_t x = (uint16_t)m[2] | ((uint16_t)m[3] << 8);
++				uint16_t y = (uint16_t)m[4] | ((uint16_t)m[5] << 8);
++				mxt_slots[contact_id].status = status;
++				mxt_slots[contact_id].active = (status & 0x80u) != 0u;
++				if (mxt_slots[contact_id].active) {
++					mxt_slots[contact_id].x = x;
++					mxt_slots[contact_id].y = y;
 +				}
-+				printf("\n");
-+				++logged;
++				printf("SWEET MXT: contact id=%d x=%u y=%u status=%#x %s\n",
++				    contact_id, x, y, status,
++				    mxt_slots[contact_id].active ? "DOWN" : "UP");
 +			}
 +		}
++		/* T6 reset/status message: report id 1, flags in byte 1, CRC in 2..4. */
++		if (id == 1u && msg_size >= 5u) {
++			printf("SWEET MXT: T6 msg status=%#x crc=%02x%02x%02x\n",
++			    m[1], m[2], m[3], m[4]);
++		}
 +	}
-+	unsigned attn_after = (touch_rd(st.gpio + XZ3_TLMM_WEST_OFS,
-+	    TOUCH_GPIO_IO(XZ3_GPIO_ATTN)) & 1u) ? 1u : 0u;
-+	printf("SWEET MXT: drained=%u attn_before=%u attn_after=%u\n",
-+	    drained, attn_before, attn_after);
-+
-+	printf("SWEET MXT: B1 parse complete, B2 will poll + emit HID\n");
-+	return true;
++	*out_drained = drained;
++	return 0;
 +}
 +
 +static void
@@ -466,10 +517,43 @@
 +	}
 +	printf("SWEET MXT: probe OK, Patch B will parse the object table\n");
 +
-+	/* Keep the thread alive so we can re-probe from the log after boot. */
-+	for (unsigned i = 0; i < 120 && !st.dead; ++i) {
-+		touch_wait(1000);
-+		(void)mxt_probe();
++	/* --- 10 ms poll loop: drain T44, decode T100 contacts, log ----- */
++	printf("SWEET MXT: entering 10 ms poll loop\n");
++	unsigned tick = 0;
++	unsigned err_count = 0;
++	unsigned id_counts[64] = {0};
++	while (!st.dead) {
++		unsigned drained = 0;
++		int rc = mxt_drain_msgs(&drained, id_counts);
++		if (rc != 0) {
++			if (++err_count >= 10u) {
++				printf("SWEET MXT: 10 consecutive drain errors, backoff 100 ms\n");
++				touch_wait(100);
++				err_count = 0;
++			}
++		} else {
++			err_count = 0;
++		}
++		if (++tick >= 500u) {
++			unsigned active = 0;
++			for (unsigned i = 0; i < 16; ++i) {
++				if (mxt_slots[i].active) {
++					++active;
++				}
++			}
++			printf("SWEET MXT: heartbeat active=%u attn=%u\n", active,
++			    (touch_rd(st.gpio + XZ3_TLMM_WEST_OFS,
++			        TOUCH_GPIO_IO(XZ3_GPIO_ATTN)) & 1u) ? 1u : 0u);
++			for (unsigned id = 0; id < 64; ++id) {
++				if (id_counts[id] > 0) {
++					printf("SWEET MXT: id %u: %u msgs\n",
++					    id, id_counts[id]);
++					id_counts[id] = 0;
++				}
++			}
++			tick = 0;
++		}
++		touch_wait(10);
 +	}
 +
 +out:
@@ -480,7 +564,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +1076,17 @@
+@@ -650,7 +1160,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
