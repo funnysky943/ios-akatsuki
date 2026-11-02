@@ -69,7 +69,7 @@
  }
  
  static bool
-@@ -545,6 +567,182 @@
+@@ -545,6 +567,194 @@
  	return true;
  }
  
@@ -185,19 +185,31 @@
 +		goto out;
 +	}
 +
-+	/* VDD (AVDD) on PM8998 LDO28 at 3.008 V; VDDIO via gpio133. */
++	/* VDD (AVDD) on PM8998 LDO28: skip RPMh for now, assume ABL left it on. */
 +	printf("SWEET TS: RPMh skipped, assuming AVDD is on\n");
 +
-+	/* VDDIO (133) high, ATTN (125) as pull-up input, RESET (99) high, then
-+	 * low pulse, then release. Delays per the panel node: 0/1/1 ms. */
-+	touch_gpio_at(st.gpio, XZ3_GPIO_VIO, 0, 0, 1, true, true);
-+	touch_gpio_at(st.gpio, XZ3_GPIO_ATTN, 0, 3, 3, false, false);
-+	touch_gpio_at(st.gpio, XZ3_GPIO_RESET, 0, 3, 2, true, true);
-+	touch_wait(1);
-+	touch_gpio_at(st.gpio, XZ3_GPIO_RESET, 0, 3, 2, true, false);
-+	touch_wait(1);
-+	touch_gpio_at(st.gpio, XZ3_GPIO_RESET, 0, 3, 2, true, true);
++	/* Sequence per Linux atmel_mxt_ts: hold reset low before power,
++	 * VDDIO on, ATTN input pull-up, settle 150 ms, release reset,
++	 * 200 ms chip boot, then mux SDA/SCL to QUP.
++	 * drive=0 (2 mA) + pull=3 (pull-up) matches ABL's cfg=0x203. */
++	touch_gpio_at(st.gpio + XZ3_TLMM_NORTH_OFS, XZ3_GPIO_RESET, 0, 3, 0, true, false);
++	touch_gpio_at(st.gpio + XZ3_TLMM_NORTH_OFS, XZ3_GPIO_VIO, 0, 3, 0, true, true);
++	touch_gpio_at(st.gpio + XZ3_TLMM_WEST_OFS, XZ3_GPIO_ATTN, 0, 3, 0, false, false);
++	touch_wait(150);   /* supply settle */
++	touch_gpio_at(st.gpio + XZ3_TLMM_NORTH_OFS, XZ3_GPIO_RESET, 0, 3, 0, true, true);
 +	touch_wait(200);   /* chip boot */
++	touch_gpio_at(st.gpio + XZ3_TLMM_WEST_OFS, 85, 1, 0, 0, false, false);
++	touch_gpio_at(st.gpio + XZ3_TLMM_WEST_OFS, 86, 1, 0, 0, false, false);
++	printf("SWEET TS: GPIO post g99 cfg=%#x io=%#x g133 cfg=%#x io=%#x\n",
++	    touch_rd(st.gpio + XZ3_TLMM_NORTH_OFS, TOUCH_GPIO_CFG(99)),
++	    touch_rd(st.gpio + XZ3_TLMM_NORTH_OFS, TOUCH_GPIO_IO(99)),
++	    touch_rd(st.gpio + XZ3_TLMM_NORTH_OFS, TOUCH_GPIO_CFG(133)),
++	    touch_rd(st.gpio + XZ3_TLMM_NORTH_OFS, TOUCH_GPIO_IO(133)));
++	printf("SWEET TS: SE5 muxed g85 cfg=%#x io=%#x g86 cfg=%#x io=%#x\n",
++	    touch_rd(st.gpio + XZ3_TLMM_WEST_OFS, TOUCH_GPIO_CFG(85)),
++	    touch_rd(st.gpio + XZ3_TLMM_WEST_OFS, TOUCH_GPIO_IO(85)),
++	    touch_rd(st.gpio + XZ3_TLMM_WEST_OFS, TOUCH_GPIO_CFG(86)),
++	    touch_rd(st.gpio + XZ3_TLMM_WEST_OFS, TOUCH_GPIO_IO(86)));
 +
 +	if (!xz3_clocks()) {
 +		goto out;
@@ -252,7 +264,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +848,17 @@
+@@ -650,7 +860,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
