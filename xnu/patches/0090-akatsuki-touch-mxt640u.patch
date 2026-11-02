@@ -69,7 +69,7 @@
  }
  
  static bool
-@@ -545,6 +567,179 @@
+@@ -545,6 +567,182 @@
  	return true;
  }
  
@@ -202,20 +202,23 @@
 +	if (!xz3_clocks()) {
 +		goto out;
 +	}
-+	/* SE5 pinmux: SDA=gpio85, SCL=gpio86, function qup5 (=1), 2 mA, no pull. */
-+	/* First, set to GPIO input and read idle levels to rule out a stuck bus. */
-+	touch_gpio_at(st.gpio, 85, 0, 0, 0, false, false);
-+	touch_gpio_at(st.gpio, 86, 0, 0, 0, false, false);
-+	touch_wait(1);
-+	printf("SWEET TS: SE5 idle SDA=%d SCL=%d\n",
-+	    (touch_rd(st.gpio, TOUCH_GPIO_IO(85)) & 2u) ? 1 : 0,
-+	    (touch_rd(st.gpio, TOUCH_GPIO_IO(86)) & 2u) ? 1 : 0);
-+	/* Mux to QUP function. */
-+	touch_gpio_at(st.gpio, 85, 1, 0, 0, false, false);
-+	touch_gpio_at(st.gpio, 86, 1, 0, 0, false, false);
-+	printf("SWEET TS: SE5 muxed cfg85=%#x cfg86=%#x\n",
-+	    touch_rd(st.gpio, TOUCH_GPIO_CFG(85)),
-+	    touch_rd(st.gpio, TOUCH_GPIO_CFG(86)));
++	/* TLMM tile probe: read-only, no writes. SDM845 TLMM is tiled
++	 * inside the 12 MiB window (WEST=0x100000, NORTH=0x500000,
++	 * SOUTH=0x900000). cfg=0 means wrong tile (unmapped) or
++	 * bias-disabled input. io bit0=pad level, bit1=latch. */
++	{
++		static const uint32_t toff[4] = { 0, 0x100000, 0x500000, 0x900000 };
++		static const char *tname[4] = { "flat", "W", "N", "S" };
++		static const int pp[5] = { 85, 86, 99, 125, 133 };
++		for (unsigned p = 0; p < 5; ++p) {
++			for (unsigned t = 0; t < 4; ++t) {
++				uint32_t o = toff[t] + 0x1000u * pp[p];
++				printf("SWEET TLMM g%d %s cfg=%#x io=%#x\n",
++				    pp[p], tname[t],
++				    touch_rd(st.gpio, o), touch_rd(st.gpio, o + 4));
++			}
++		}
++	}
 +
 +	printf("SWEET TS: calling touch_se_init\n");
 +	if (!touch_se_init()) {
@@ -249,7 +252,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +845,17 @@
+@@ -650,7 +848,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
