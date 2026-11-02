@@ -71,7 +71,7 @@
  }
  
  static bool
-@@ -545,6 +569,194 @@
+@@ -545,6 +569,408 @@
  	return true;
  }
  
@@ -147,6 +147,74 @@
 +	return touch_msg(XZ3_TS_ADDR, NULL, 0, buf, len, false);
 +}
 +
++/* Chunked read: register space is random-access, so re-issue the address
++ * per chunk. Chunk 32 bytes (8 FIFO words at 4 B/word) to stay well
++ * below touch_msg's 90-byte single-transfer limit. */
++static int
++mxt_read_chunked(uint16_t reg, uint8_t *buf, unsigned len)
++{
++	unsigned done = 0;
++	while (done < len) {
++		unsigned n = len - done;
++		if (n > 32) {
++			n = 32;
++		}
++		int err = mxt_read((uint16_t)(reg + done), buf + done, n);
++		if (err) {
++			return err;
++		}
++		done += n;
++	}
++	return 0;
++}
++
++/* CRC24 over the info block and object table, per atmel_mxt_ts.c
++ * mxt_calc_crc24. Feed bytes in (lo, hi) pairs; pad odd with 0. */
++static void
++mxt_crc24_step(uint32_t *c, uint8_t a, uint8_t b)
++{
++	uint32_t r = (*c << 1) ^ ((uint32_t)b << 8) ^ (uint32_t)a;
++	if (r & 0x1000000u) {
++		r ^= 0x80001Bu;
++	}
++	*c = r;
++}
++
++static uint32_t
++mxt_crc24(const uint8_t *buf, unsigned len)
++{
++	uint32_t c = 0;
++	unsigned i = 0;
++	for (; i + 1 < len; i += 2) {
++		mxt_crc24_step(&c, buf[i], buf[i + 1]);
++	}
++	if (i < len) {
++		mxt_crc24_step(&c, buf[i], 0);
++	}
++	return c & 0xFFFFFFu;
++}
++
++/* Object table (40 entries for mXT640U; 64 max for headroom). */
++#define MXT_MAX_OBJECTS 64u
++struct mxt_object {
++	uint8_t  type;
++	uint16_t addr;
++	uint8_t  size;
++	uint8_t  instances;
++	uint8_t  num_ids;
++	uint8_t  min_id;
++	uint8_t  max_id;
++};
++static struct mxt_object mxt_objs[MXT_MAX_OBJECTS];
++static uint8_t  mxt_nobjs;
++static uint8_t  mxt_t5_addr, mxt_t5_size;
++static uint8_t  mxt_t6_addr, mxt_t6_size;
++static uint8_t  mxt_t7_addr;
++static uint8_t  mxt_t44_addr;
++static uint8_t  mxt_t100_addr, mxt_t100_size;
++static uint8_t  mxt_t100_minid;
++static uint8_t  mxt_next_report_id;
+++
 +static bool
 +mxt_probe(void)
 +{
@@ -166,6 +234,152 @@
 +		printf("SWEET MXT: info block reads as all-zero, chip not answering\n");
 +		return false;
 +	}
++
++	/* --- Object table + CRC ---------------------------------------- */
++	unsigned nobj = ib[6];
++	if (nobj == 0 || nobj > MXT_MAX_OBJECTS) {
++		printf("SWEET MXT: bad object count %u\n", nobj);
++		return false;
++	}
++	unsigned tbl_len = 7u + 6u * nobj;
++	unsigned total = tbl_len + 3u;
++	uint8_t buf[MXT_MAX_OBJECTS * 6u + 7u + 3u];
++	err = mxt_read_chunked(0x0000, buf, total);
++	if (err != 0) {
++		printf("SWEET MXT: table read failed err=%d len=%u\n", err, total);
++		return false;
++	}
++	uint32_t crc_calc = mxt_crc24(buf, tbl_len);
++	uint32_t crc_read = (uint32_t)buf[tbl_len]
++	    | ((uint32_t)buf[tbl_len + 1] << 8)
++	    | ((uint32_t)buf[tbl_len + 2] << 16);
++	printf("SWEET MXT: crc calc=%#x read=%#x %s\n",
++	    crc_calc, crc_read, crc_calc == crc_read ? "OK" : "MISMATCH");
++
++	/* --- Parse object table ---------------------------------------- */
++	mxt_nobjs = 0;
++	mxt_next_report_id = 1;
++	mxt_t5_addr = mxt_t6_addr = mxt_t7_addr = mxt_t44_addr = mxt_t100_addr = 0;
++	mxt_t5_size = mxt_t6_size = mxt_t100_size = 0;
++	mxt_t100_minid = 0;
++	const uint8_t *p = buf + 7;
++	for (unsigned i = 0; i < nobj; ++i, p += 6) {
++		struct mxt_object *o = &mxt_objs[mxt_nobjs++];
++		o->type      = p[0];
++		o->addr      = (uint16_t)(p[1] | ((uint16_t)p[2] << 8));
++		o->size      = (uint8_t)(p[3] + 1);
++		o->instances = (uint8_t)(p[4] + 1);
++		o->num_ids   = p[5];
++		if (o->num_ids) {
++			o->min_id = mxt_next_report_id;
++			mxt_next_report_id = (uint8_t)(mxt_next_report_id
++			    + o->num_ids * o->instances);
++			o->max_id = (uint8_t)(mxt_next_report_id - 1);
++		}
++		switch (o->type) {
++		case 5:   mxt_t5_addr   = o->addr; mxt_t5_size   = o->size; break;
++		case 6:   mxt_t6_addr   = o->addr; mxt_t6_size   = o->size; break;
++		case 7:   mxt_t7_addr   = o->addr; break;
++		case 44:  mxt_t44_addr  = o->addr; break;
++		case 100:
++			mxt_t100_addr = o->addr;
++			mxt_t100_size = o->size;
++			mxt_t100_minid = o->min_id;
++			break;
++		}
++	}
++	/* Compact table log: 5 objects per line */
++	for (unsigned i = 0; i < mxt_nobjs; i += 5) {
++		printf("SWEET MXT: obj[%u] ", i);
++		for (unsigned j = i; j < i + 5 && j < mxt_nobjs; ++j) {
++			struct mxt_object *o = &mxt_objs[j];
++			printf("T%u@%#x s%u i%u r%u  ",
++			    o->type, o->addr, o->size, o->instances, o->num_ids);
++		}
++		printf("\n");
++	}
++	printf("SWEET MXT: found T5=%u@%#x T6=%u@%#x T7@%#x T44@%#x"
++	    " T100=%u@%#x minid=%u nextid=%u\n",
++	    mxt_t5_size, mxt_t5_addr, mxt_t6_size, mxt_t6_addr,
++	    mxt_t7_addr, mxt_t44_addr,
++	    mxt_t100_size, mxt_t100_addr, mxt_t100_minid, mxt_next_report_id);
++	if (!mxt_t5_addr || !mxt_t100_addr) {
++		printf("SWEET MXT: missing T5 or T100, cannot proceed\n");
++		return false;
++	}
++
++	/* --- T100 config (offset+len checked against T100.size) -------- */
++	uint8_t t100cfg[32] = {0};
++	unsigned tlen = mxt_t100_size < sizeof(t100cfg) ? mxt_t100_size : sizeof(t100cfg);
++	err = mxt_read_chunked(mxt_t100_addr, t100cfg, tlen);
++	if (err == 0 && mxt_t100_size >= 26) {
++		uint8_t ctrl   = t100cfg[0];
++		uint8_t cfg1   = t100cfg[1];
++		uint8_t tchaux = t100cfg[3];
++		uint16_t xr    = (uint16_t)(t100cfg[13] | ((uint16_t)t100cfg[14] << 8));
++		uint16_t yr    = (uint16_t)(t100cfg[24] | ((uint16_t)t100cfg[25] << 8));
++		printf("SWEET MXT: T100 ctrl=%#x cfg1=%#x tchaux=%#x xrange=%u yrange=%u\n",
++		    ctrl, cfg1, tchaux, xr, yr);
++	} else {
++		printf("SWEET MXT: T100 config read failed err=%d size=%u\n",
++		    err, mxt_t100_size);
++	}
++
++	/* --- T6 status byte ------------------------------------------- */
++	if (mxt_t6_addr && mxt_t6_size >= 1) {
++		uint8_t st6 = 0;
++		if (mxt_read(mxt_t6_addr, &st6, 1) == 0) {
++			printf("SWEET MXT: T6 status=%#x%s%s%s%s%s\n", st6,
++			    (st6 & 0x80) ? " RESET" : "",
++			    (st6 & 0x20) ? " SIGERR" : "",
++			    (st6 & 0x10) ? " CAL" : "",
++			    (st6 & 0x08) ? " CFGERR" : "",
++			    (st6 & 0x04) ? " COMSERR" : "");
++		}
++	}
++
++	/* --- T7 power config (3 bytes) -------------------------------- */
++	if (mxt_t7_addr) {
++		uint8_t t7[3] = {0};
++		if (mxt_read_chunked(mxt_t7_addr, t7, 3) == 0) {
++			printf("SWEET MXT: T7 power=%02x %02x %02x\n",
++			    t7[0], t7[1], t7[2]);
++		}
++	}
++
++	/* --- ATTN pad level + drain pending T5 messages ---------------- */
++	unsigned attn_before = (touch_rd(st.gpio + XZ3_TLMM_WEST_OFS,
++	    TOUCH_GPIO_IO(XZ3_GPIO_ATTN)) & 1u) ? 1u : 0u;
++	unsigned msg_size = (mxt_t5_size > 1u) ? (mxt_t5_size - 1u) : 0u;
++	unsigned drained = 0;
++	unsigned logged = 0;
++	if (msg_size > 0 && msg_size <= 16u) {
++		for (unsigned k = 0; k < 32u; ++k) {
++			uint8_t m[16] = {0};
++			if (mxt_read_chunked(mxt_t5_addr, m, msg_size) != 0) {
++				break;
++			}
++			if (m[0] == 0xFFu) {
++				break;
++			}
++			++drained;
++			if (logged < 5) {
++				unsigned nshow = msg_size < 8u ? msg_size : 8u;
++				printf("SWEET MXT: msg id=%u", m[0]);
++				for (unsigned b = 1; b < nshow; ++b) {
++					printf(" %02x", m[b]);
++				}
++				printf("\n");
++				++logged;
++			}
++		}
++	}
++	unsigned attn_after = (touch_rd(st.gpio + XZ3_TLMM_WEST_OFS,
++	    TOUCH_GPIO_IO(XZ3_GPIO_ATTN)) & 1u) ? 1u : 0u;
++	printf("SWEET MXT: drained=%u attn_before=%u attn_after=%u\n",
++	    drained, attn_before, attn_after);
++
++	printf("SWEET MXT: B1 parse complete, B2 will poll + emit HID\n");
 +	return true;
 +}
 +
@@ -266,7 +480,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +862,17 @@
+@@ -650,7 +1076,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
