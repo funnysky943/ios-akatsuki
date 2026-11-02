@@ -71,7 +71,7 @@
  }
  
  static bool
-@@ -545,6 +569,492 @@
+@@ -545,6 +569,523 @@
  	return true;
  }
  
@@ -214,6 +214,8 @@
 +static uint16_t mxt_t5_size, mxt_t6_size, mxt_t100_size;
 +static uint8_t  mxt_t100_minid;
 +static uint8_t  mxt_next_report_id;
++static uint16_t mxt_t100_xrange, mxt_t100_yrange;
++static uint8_t  mxt_t100_cfg1;
 +/* T100 contact slot tracking (16 contact slots per num_report_ids - 2) */
 +static struct {
 +	uint16_t x, y;
@@ -324,8 +326,11 @@
 +		uint8_t tchaux = t100cfg[3];
 +		uint16_t xr    = (uint16_t)(t100cfg[13] | ((uint16_t)t100cfg[14] << 8));
 +		uint16_t yr    = (uint16_t)(t100cfg[24] | ((uint16_t)t100cfg[25] << 8));
-+		printf("SWEET MXT: T100 ctrl=%#x cfg1=%#x tchaux=%#x xrange=%u yrange=%u\n",
-+		    ctrl, cfg1, tchaux, xr, yr);
++		mxt_t100_cfg1 = cfg1;
++		mxt_t100_xrange = xr;
++		mxt_t100_yrange = yr;
++		printf("SWEET MXT: T100 ctrl=%#x cfg1=%#x tchaux=%#x xrange=%u yrange=%u switchxy=%u\n",
++		    ctrl, cfg1, tchaux, xr, yr, (cfg1 & 0x20u) ? 1u : 0u);
 +	} else {
 +		printf("SWEET MXT: T100 config read failed err=%d size=%u\n",
 +		    err, mxt_t100_size);
@@ -429,6 +434,32 @@
 +			printf("SWEET MXT: T6 msg status=%#x crc=%02x%02x%02x\n",
 +			    m[1], m[2], m[3], m[4]);
 +		}
++	}
++	/* --- Emit HID events for active slots ------------------------- */
++	/* touch_report() (from 0060) internally tracks state and only fires
++	 * sweet_hid_touch on down/move/up. It caps at TOUCH_MAX=10 slots. */
++	{
++		uint32_t mask = 0;
++		int px[10] = {0}, py[10] = {0};
++		uint16_t xden = (uint16_t)(mxt_t100_yrange + 1u);
++		uint16_t yden = (uint16_t)(mxt_t100_xrange + 1u);
++		if (xden == 0) xden = 1440;
++		if (yden == 0) yden = 2880;
++		for (unsigned i = 0; i < 10u; ++i) {
++			if (!mxt_slots[i].active) {
++				continue;
++			}
++			unsigned xv = (unsigned)mxt_slots[i].x;
++			unsigned yv = (unsigned)mxt_slots[i].y;
++			unsigned pxx = (unsigned)(((uint32_t)xv * 1440u) / xden);
++			unsigned pyy = (unsigned)(((uint32_t)yv * 2880u) / yden);
++			if (pxx > 1439u) pxx = 1439u;
++			if (pyy > 2879u) pyy = 2879u;
++			px[i] = (int)pxx;
++			py[i] = (int)pyy;
++			mask |= 1u << i;
++		}
++		touch_report(mask, px, py);
 +	}
 +	*out_drained = drained;
 +	return 0;
@@ -564,7 +595,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -650,7 +1160,17 @@
+@@ -650,7 +1191,17 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
