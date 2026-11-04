@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -259,4 +259,20 @@
+     IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+         fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++    {
++        int vig0reprogram = 0;
++        PE_parse_boot_argn("vig0reprogram", &vig0reprogram, sizeof(vig0reprogram));
++        if (vig0reprogram) {
++            volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
++            if (vig0 != NULL) {
++                uint32_t before = vig0[0x24 / 4];
++                IOLog("SWEET FB: VIG0 stride before = %u\n", before);
++                vig0[0x24 / 4] = 5760;
++                uint32_t after = vig0[0x24 / 4];
++                IOLog("SWEET FB: VIG0 stride after = %u (wanted 5760)\n", after);
++            } else {
++                IOLog("SWEET FB: VIG0 map failed\n");
++            }
++        }
++    }
+     return true;
+ }

@@ -991,7 +991,7 @@
 +#endif /* SWEET */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,455 @@
 +/*
 + * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
 + * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
@@ -1158,33 +1158,6 @@
 +	registerService();
 +	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
 +	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
-+
-+	/* VIG0 stride reprogram: ABL leaves DPU VIG0 at stride 4320 (1080 px),
-+	 * but panel is 1440 px. With FB_W=1440 every row is 5760 bytes and the
-+	 * DPU reads 4320/row, wrapping every 3 rows -> 3x tiling.
-+	 * Gate behind boot-arg vig0reprogram=1 so we can A/B test safely. */
-+	{
-+		int vig0reprogram = 0;
-+		PE_parse_boot_argn("vig0reprogram", &vig0reprogram, sizeof(vig0reprogram));
-+		if (vig0reprogram) {
-+			IOLog("SWEET FB: VIG0 reprogram enabled, mapping 0xae05000\n");
-+			volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
-+			if (vig0 != NULL) {
-+				uint32_t old_stride = vig0[0x24 / 4];
-+				IOLog("SWEET FB: VIG0 stride before = %u\n", old_stride);
-+				vig0[0x24 / 4] = 5760;
-+				uint32_t new_stride = vig0[0x24 / 4];
-+				IOLog("SWEET FB: VIG0 stride after = %u (wanted 5760)\n", new_stride);
-+				if (new_stride == 5760) {
-+					IOLog("SWEET FB: VIG0 reprogrammed OK, expect 1440-wide display\n");
-+				} else {
-+					IOLog("SWEET FB: VIG0 write did not stick (readback %u)\n", new_stride);
-+				}
-+			} else {
-+				IOLog("SWEET FB: VIG0 map failed\n");
-+			}
-+		}
-+	}
 +	return true;
 +}
 +
