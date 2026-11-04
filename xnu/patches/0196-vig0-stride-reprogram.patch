@@ -8,7 +8,7 @@
 +		int vig0reprogram = 0;
 +		PE_parse_boot_argn("vig0reprogram", &vig0reprogram, sizeof(vig0reprogram));
 +		if (vig0reprogram) {
-+			extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++			extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +			volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
 +			if (vig0 != NULL) {
 +				uint32_t before = vig0[0x24 / 4];
