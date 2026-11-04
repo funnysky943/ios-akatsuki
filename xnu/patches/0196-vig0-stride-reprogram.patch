@@ -1,9 +1,10 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -259,4 +259,20 @@
-     IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
-         fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
-+    {
+@@ -297,2 +297,20 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
++    static bool vig0Done = false;
++    if (!vig0Done) {
 +        int vig0reprogram = 0;
 +        PE_parse_boot_argn("vig0reprogram", &vig0reprogram, sizeof(vig0reprogram));
 +        if (vig0reprogram) {
@@ -18,6 +19,5 @@
 +                IOLog("SWEET FB: VIG0 map failed\n");
 +            }
 +        }
++        vig0Done = true;
 +    }
-     return true;
- }
