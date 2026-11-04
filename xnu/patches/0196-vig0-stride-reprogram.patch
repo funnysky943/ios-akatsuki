@@ -3,22 +3,22 @@
 @@ -308,3 +308,21 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
-+        static bool vig0Done = false;
-+        if (!vig0Done) {
-+                int vig0reprogram = 0;
-+                PE_parse_boot_argn("vig0reprogram", &vig0reprogram, sizeof(vig0reprogram));
-+                if (vig0reprogram) {
-+                        volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
-+                        if (vig0 != NULL) {
-+                                uint32_t before = vig0[0x24 / 4];
-+                                IOLog("SWEET FB: VIG0 stride before = %u\n", before);
-+                                vig0[0x24 / 4] = 5760;
-+                                uint32_t after = vig0[0x24 / 4];
-+                                IOLog("SWEET FB: VIG0 stride after = %u (wanted 5760)\n", after);
-+                        } else {
-+                                IOLog("SWEET FB: VIG0 map failed\n");
-+                        }
-+                }
-+                vig0Done = true;
-+        }
-         AppleCLCD *fb = (AppleCLCD *)owner;
++	static bool vig0Done = false;
++	if (!vig0Done) {
++		int vig0reprogram = 0;
++		PE_parse_boot_argn("vig0reprogram", &vig0reprogram, sizeof(vig0reprogram));
++		if (vig0reprogram) {
++			volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
++			if (vig0 != NULL) {
++				uint32_t before = vig0[0x24 / 4];
++				IOLog("SWEET FB: VIG0 stride before = %u\n", before);
++				vig0[0x24 / 4] = 5760;
++				uint32_t after = vig0[0x24 / 4];
++				IOLog("SWEET FB: VIG0 stride after = %u (wanted 5760)\n", after);
++			} else {
++				IOLog("SWEET FB: VIG0 map failed\n");
++			}
++		}
++		vig0Done = true;
++	}
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
