@@ -49,6 +49,10 @@ jobs:
         # closing #endif vanished from pexpert/arm64/SWEET.h (patch 0004).
         run: python3 tools/check-hunk-counts.py xnu/patches
 
+      - name: Redirect BearSSL to GitHub mirror
+        run: |
+          git config --global url."https://github.com/AmanoTeam/BearSSL.git".insteadOf "https://www.bearssl.org/git/BearSSL"
+
       - name: Fetch build script
         run: |
           git init -q dxb
