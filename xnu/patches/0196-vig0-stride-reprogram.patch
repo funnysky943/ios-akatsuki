@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -308,3 +308,22 @@
+@@ -308,3 +308,24 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
 +	static bool vig0Done = false;
@@ -10,14 +10,16 @@
 +		if (vig0reprogram) {
 +			extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t) __asm__("_ml_io_map");
 +			volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
-+			if (vig0 != NULL) {
++			volatile uint32_t *ctl0 = (volatile uint32_t *)ml_io_map(0xae01000, 0x1000);
++			if (vig0 != NULL && ctl0 != NULL) {
 +				uint32_t before = vig0[0x24 / 4];
 +				IOLog("SWEET FB: VIG0 stride before = %u\n", before);
 +				vig0[0x24 / 4] = 5760;
-+				uint32_t after = vig0[0x24 / 4];
-+				IOLog("SWEET FB: VIG0 stride after = %u (wanted 5760)\n", after);
++				IOLog("SWEET FB: VIG0 stride after = %u (wanted 5760)\n", vig0[0x24 / 4]);
++				ctl0[0x18 / 4] = 0x20001;
++				IOLog("SWEET FB: CTL0 flush 0x20001 written, latched at vsync\n");
 +			} else {
-+				IOLog("SWEET FB: VIG0 map failed\n");
++				IOLog("SWEET FB: VIG0/CTL0 map failed\n");
 +			}
 +		}
 +		vig0Done = true;
