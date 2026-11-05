@@ -11,7 +11,7 @@
  	registerService();
 +	sweet_publish_scaler_stub(this);
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
-@@ -706,3 +709,50 @@
+@@ -706,3 +709,51 @@
  	return ret;
  }
 +namespace {
@@ -58,6 +58,7 @@
 +        stub->release();
 +        return;
 +    }
++    stub->setProperty("IOClass", "AppleM2ScalerCSCDriver");
 +    stub->setName("AppleM2ScalerCSCDriver");
 +    IOLog("SWEET FB: scaler stub published as AppleM2ScalerCSCDriver\n");
 +}
