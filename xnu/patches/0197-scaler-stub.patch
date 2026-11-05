@@ -11,7 +11,7 @@
  	registerService();
 +	sweet_publish_scaler_stub(this);
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
-@@ -706,3 +709,48 @@
+@@ -706,3 +709,50 @@
  	return ret;
  }
 +namespace {
@@ -33,16 +33,18 @@
 +        registerService();
 +        return true;
 +    }
-+    virtual IOUserClient *newUserClient(task_t owningTask, void *securityToken,
-+        uint32_t type, OSDictionary *properties) override {
++    virtual IOReturn newUserClient(task_t owningTask, void *securityID,
++        UInt32 type, OSDictionary *properties,
++        LIBKERN_RETURNS_RETAINED IOUserClient **handler) override {
 +        SweetScalerStubClient *c = OSTypeAlloc(SweetScalerStubClient);
-+        if (c == nullptr) return nullptr;
-+        if (!c->initWithTask(owningTask, securityToken, type) ||
++        if (c == nullptr) return kIOReturnNoMemory;
++        if (!c->initWithTask(owningTask, securityID, type) ||
 +            !c->attach(this) || !c->start(this)) {
 +            c->release();
-+            return nullptr;
++            return kIOReturnError;
 +        }
-+        return c;
++        *handler = c;
++        return kIOReturnSuccess;
 +    }
 +};
 +OSDefineMetaClassAndStructors(SweetScalerStub, IOService)
