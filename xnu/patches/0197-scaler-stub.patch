@@ -1,0 +1,62 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,3 +41,5 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
++void sweet_publish_scaler_stub(class IOService *parent);
++
+ #if defined(SWEET)
+@@ -255,3 +257,4 @@
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	sweet_publish_scaler_stub(this);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+@@ -706,3 +709,48 @@
+ 	return ret;
+ }
++namespace {
++class SweetScalerStubClient : public IOUserClient {
++    OSDeclareDefaultStructors(SweetScalerStubClient)
++public:
++    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++        IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override {
++        return kIOReturnSuccess;
++    }
++};
++OSDefineMetaClassAndStructors(SweetScalerStubClient, IOUserClient)
++
++class SweetScalerStub : public IOService {
++    OSDeclareDefaultStructors(SweetScalerStub)
++public:
++    virtual bool start(IOService *provider) override {
++        if (!IOService::start(provider)) return false;
++        registerService();
++        return true;
++    }
++    virtual IOUserClient *newUserClient(task_t owningTask, void *securityToken,
++        uint32_t type, OSDictionary *properties) override {
++        SweetScalerStubClient *c = OSTypeAlloc(SweetScalerStubClient);
++        if (c == nullptr) return nullptr;
++        if (!c->initWithTask(owningTask, securityToken, type) ||
++            !c->attach(this) || !c->start(this)) {
++            c->release();
++            return nullptr;
++        }
++        return c;
++    }
++};
++OSDefineMetaClassAndStructors(SweetScalerStub, IOService)
++}
++
++void sweet_publish_scaler_stub(class IOService *parent)
++{
++    SweetScalerStub *stub = OSTypeAlloc(SweetScalerStub);
++    if (stub == nullptr) return;
++    if (!stub->init() || !stub->attach(parent) || !stub->start(parent)) {
++        stub->release();
++        return;
++    }
++    stub->setName("AppleM2ScalerCSCDriver");
++    IOLog("SWEET FB: scaler stub published as AppleM2ScalerCSCDriver\n");
++}
+ #endif /* SWEET */
