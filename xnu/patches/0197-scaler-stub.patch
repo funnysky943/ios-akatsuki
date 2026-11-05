@@ -11,7 +11,7 @@
  	registerService();
 +	sweet_publish_scaler_stub(this);
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
-@@ -706,3 +709,51 @@
+@@ -706,3 +709,50 @@
  	return ret;
  }
 +namespace {
@@ -25,8 +25,8 @@
 +};
 +OSDefineMetaClassAndStructors(SweetScalerStubClient, IOUserClient)
 +
-+class SweetScalerStub : public IOService {
-+    OSDeclareDefaultStructors(SweetScalerStub)
++class AppleM2ScalerCSCDriver : public IOService {
++    OSDeclareDefaultStructors(AppleM2ScalerCSCDriver)
 +public:
 +    virtual bool start(IOService *provider) override {
 +        if (!IOService::start(provider)) return false;
@@ -47,18 +47,17 @@
 +        return kIOReturnSuccess;
 +    }
 +};
-+OSDefineMetaClassAndStructors(SweetScalerStub, IOService)
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService)
 +}
 +
 +void sweet_publish_scaler_stub(class IOService *parent)
 +{
-+    SweetScalerStub *stub = OSTypeAlloc(SweetScalerStub);
++    AppleM2ScalerCSCDriver *stub = OSTypeAlloc(AppleM2ScalerCSCDriver);
 +    if (stub == nullptr) return;
 +    if (!stub->init() || !stub->attach(parent) || !stub->start(parent)) {
 +        stub->release();
 +        return;
 +    }
-+    stub->setProperty("IOClass", "AppleM2ScalerCSCDriver");
 +    stub->setName("AppleM2ScalerCSCDriver");
 +    IOLog("SWEET FB: scaler stub published as AppleM2ScalerCSCDriver\n");
 +}
