@@ -11,7 +11,7 @@
  	registerService();
 +	sweet_publish_scaler_stub(this);
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
-@@ -706,3 +709,50 @@
+@@ -706,3 +709,53 @@
  	return ret;
  }
 +namespace {
@@ -20,6 +20,9 @@
 +public:
 +    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +        IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override {
++        IOLog("SWEET SCALER: externalMethod selector=%u scalarIn=%u structIn=%u scalarOut=%u structOut=%u\n",
++            selector, args->scalarInputCount, args->structureInputSize,
++            args->scalarOutputCount, args->structureOutputSize);
 +        return kIOReturnSuccess;
 +    }
 +};
