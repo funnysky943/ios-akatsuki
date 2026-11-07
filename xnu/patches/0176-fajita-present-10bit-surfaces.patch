@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -83,6 +83,7 @@
+@@ -81,6 +81,7 @@
  #define SWEET_FB_LOGICAL_W              1125
  #define SWEET_FB_LOGICAL_H              2436
  #define SWEET_FB_FORMAT_BGRA            0x42475241
@@ -8,7 +8,7 @@
  
  class IOMobileFramebuffer : public IOService {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
-@@ -520,16 +520,42 @@
+@@ -444,17 +445,40 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -50,8 +50,6 @@
 +					out[x * 4 + 2] = (uint8_t)(r >> 2);
 +					out[x * 4 + 3] = 0xff;
 +				}
-+			}
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			(void)*(volatile uint32_t *)(fPixels + (uint64_t)dy * fRowBytes);
+ 			}
  		}
  		s->release();

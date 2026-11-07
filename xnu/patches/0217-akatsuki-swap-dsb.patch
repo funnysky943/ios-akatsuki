@@ -1,0 +1,9 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -557,4 +557,6 @@
+ 				}
+ 			}
++ 			__asm__ volatile("dsb sy" ::: "memory");
++ 			(void)*(volatile uint32_t *)(fPixels + (uint64_t)dy * fRowBytes);
+ 		}
+ 		s->release();
