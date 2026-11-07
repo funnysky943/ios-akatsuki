@@ -8,7 +8,7 @@
  
  class IOMobileFramebuffer : public IOService {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
-@@ -444,17 +445,40 @@
+@@ -444,16 +445,42 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -50,6 +50,8 @@
 +					out[x * 4 + 2] = (uint8_t)(r >> 2);
 +					out[x * 4 + 3] = 0xff;
 +				}
- 			}
++			}
++			__asm__ volatile("dsb sy" ::: "memory");
++			(void)*(volatile uint32_t *)(fPixels + (uint64_t)dy * fRowBytes);
  		}
  		s->release();
