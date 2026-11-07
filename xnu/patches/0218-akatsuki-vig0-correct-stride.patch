@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -308,3 +308,20 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
++    static bool vig0Done = false;
++    if (!vig0Done) {
++        int enable = 0;
++        PE_parse_boot_argn("vig0reprogram", &enable, sizeof(enable));
++        if (enable) {
++            extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t) __asm__("_ml_io_map");
++            volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae04000, 0x1000);
++            volatile uint32_t *ctl0 = (volatile uint32_t *)ml_io_map(0xae01000, 0x1000);
++            if (vig0 != NULL && ctl0 != NULL) {
++                IOLog("SWEET FB: VIG0(0xae04000) stride before=%u\n", vig0[0x24/4]);
++                vig0[0x24/4] = 5760;
++                ctl0[0x18/4] = 0x20001;
++                IOLog("SWEET FB: VIG0 stride after=%u CTL flushed\n", vig0[0x24/4]);
++            }
++        }
++        vig0Done = true;
++    }
+     AppleCLCD *fb = (AppleCLCD *)owner;
