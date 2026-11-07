@@ -1,7 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -308,3 +308,20 @@
- AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -312,2 +312,19 @@
  {
 +    static bool vig0Done = false;
 +    if (!vig0Done) {
@@ -20,4 +19,4 @@
 +        }
 +        vig0Done = true;
 +    }
-     AppleCLCD *fb = (AppleCLCD *)owner;
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
