@@ -1,0 +1,28 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,2 +312,25 @@
+ {
++	static bool fmtDone = false;
++	if (!fmtDone) {
++	    int enable = 0;
++	    PE_parse_boot_argn("vig0reprogram", &enable, sizeof(enable));
++	    if (enable) {
++	        extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t) __asm__("_ml_io_map");
++	        volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
++	        volatile uint32_t *lm0 = (volatile uint32_t *)ml_io_map(0xae45000, 0x1000);
++	        volatile uint32_t *pp0 = (volatile uint32_t *)ml_io_map(0xae71000, 0x800);
++	        volatile uint32_t *intf1 = (volatile uint32_t *)ml_io_map(0xae6b800, 0x800);
++	        if (vig0 && lm0 && pp0 && intf1) {
++	            uint32_t fmt = vig0[0x30/4];
++	            IOLog("SWEET FB: VIG0 FORMAT=%#x bpp=%u comp=%u STRIDE=%u SIZE=%#x OUT=%#x\n",
++	                fmt, ((fmt >> 9) & 3) + 1, ((fmt >> 12) & 3) + 1,
++	                vig0[0x24/4], vig0[0x00/4], vig0[0x0c/4]);
++	            IOLog("SWEET FB: LM0 OUT=%#x PP0 OP=%#x\n",
++	                lm0[0x04/4], pp0[0x00/4]);
++	            IOLog("SWEET FB: INTF1 CFG0=%#x CFG1=%#x CFG2=%#x HS=%#x\n",
++	                intf1[0x00/4], intf1[0x04/4], intf1[0x08/4], intf1[0x18/4]);
++	        }
++	    }
++	    fmtDone = true;
++	}
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
