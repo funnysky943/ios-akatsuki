@@ -1,0 +1,21 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,2 +312,18 @@
+ {
++	static bool dsiDone = false;
++	if (!dsiDone) {
++	    int enable = 0;
++	    PE_parse_boot_argn("vig0reprogram", &enable, sizeof(enable));
++	    if (enable) {
++	        extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t) __asm__("_ml_io_map");
++	        volatile uint32_t *dsi = (volatile uint32_t *)ml_io_map(0xae94000, 0x400);
++	        if (dsi != NULL) {
++	            uint32_t ctrl = dsi[0x54/4];
++	            uint32_t total = dsi[0x58/4];
++	            IOLog("SWEET FB: DSI STREAM_CTRL=%#x wc=%u STREAM_TOTAL=%#x H=%u V=%u\n",
++	                ctrl, (ctrl >> 16) & 0xffff, total, total & 0xfff, (total >> 16) & 0xfff);
++	        }
++	    }
++	    dsiDone = true;
++	}
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
