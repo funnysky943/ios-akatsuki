@@ -1,0 +1,35 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,2 +312,32 @@
+ {
++	static bool ssppDone = false;
++	if (!ssppDone) {
++	    int enable = 0;
++	    PE_parse_boot_argn("vig0reprogram", &enable, sizeof(enable));
++	    if (enable) {
++	        extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t) __asm__("_ml_io_map");
++	        volatile uint32_t *base = (volatile uint32_t *)ml_io_map(0xae05000, 0x27000);
++	        if (base != NULL) {
++	            IOLog("SWEET FB: VIG0 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x014/4], base[0x024/4], base[0x00c/4]);
++	            IOLog("SWEET FB: VIG1 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x2014/4], base[0x2024/4], base[0x200c/4]);
++	            IOLog("SWEET FB: VIG2 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x4014/4], base[0x4024/4], base[0x400c/4]);
++	            IOLog("SWEET FB: VIG3 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x6014/4], base[0x6024/4], base[0x600c/4]);
++	            IOLog("SWEET FB: DMA0 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x20014/4], base[0x20024/4], base[0x2000c/4]);
++	            IOLog("SWEET FB: DMA1 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x22014/4], base[0x22024/4], base[0x2200c/4]);
++	            IOLog("SWEET FB: DMA2 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x24014/4], base[0x24024/4], base[0x2400c/4]);
++	            IOLog("SWEET FB: DMA3 ADDR=%#x STRIDE=%#x SIZE=%#x\n",
++	                base[0x26014/4], base[0x26024/4], base[0x2600c/4]);
++	        } else {
++	            IOLog("SWEET FB: SSPP map failed\n");
++	        }
++	    }
++	    ssppDone = true;
++	}
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
