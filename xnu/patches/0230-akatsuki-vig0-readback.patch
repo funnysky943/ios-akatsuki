@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,2 +312,23 @@
+ {
++	static bool vig0Done = false;
++	if (!vig0Done) {
++	    int enable = 0;
++	    PE_parse_boot_argn("vig0reprogram", &enable, sizeof(enable));
++	    if (enable) {
++	        extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t) __asm__("_ml_io_map");
++	        volatile uint32_t *vig0 = (volatile uint32_t *)ml_io_map(0xae05000, 0x1000);
++	        volatile uint32_t *ctl0 = (volatile uint32_t *)ml_io_map(0xae02000, 0x400);
++	        if (vig0 && ctl0) {
++	            IOLog("SWEET FB: VIG0 pre FORMAT=%#x STRIDE=%u UNPACK=%#x SIZE=%#x OUT=%#x\n",
++	                vig0[0x30/4], vig0[0x24/4], vig0[0x34/4], vig0[0x00/4], vig0[0x0c/4]);
++	            vig0[0x24/4] = 5760;
++	            ctl0[0x18/4] = 0x20001;
++	            IOLog("SWEET FB: VIG0 post FORMAT=%#x STRIDE=%u UNPACK=%#x\n",
++	                vig0[0x30/4], vig0[0x24/4], vig0[0x34/4]);
++	        } else {
++	            IOLog("SWEET FB: VIG0/CTL0 map failed\n");
++	        }
++	    }
++	    vig0Done = true;
++	}
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
