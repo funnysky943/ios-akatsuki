@@ -1,0 +1,44 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,2 +312,41 @@
+ {
++	static bool dpuDone = false;
++	if (!dpuDone) {
++	    int enable = 0;
++	    PE_parse_boot_argn("vig0reprogram", &enable, sizeof(enable));
++	    if (enable) {
++	        extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t) __asm__("_ml_io_map");
++	        volatile uint32_t *top = (volatile uint32_t *)ml_io_map(0xae01000, 0x1000);
++	        volatile uint32_t *ctl0 = (volatile uint32_t *)ml_io_map(0xae02000, 0x400);
++	        volatile uint32_t *dma1 = (volatile uint32_t *)ml_io_map(0xae27000, 0x1000);
++	        volatile uint32_t *lm0 = (volatile uint32_t *)ml_io_map(0xae45000, 0x1000);
++	        volatile uint32_t *pp0 = (volatile uint32_t *)ml_io_map(0xae71000, 0x800);
++	        volatile uint32_t *dsc0 = (volatile uint32_t *)ml_io_map(0xae81000, 0x400);
++	        volatile uint32_t *dsc1 = (volatile uint32_t *)ml_io_map(0xae81400, 0x400);
++	        volatile uint32_t *intf1 = (volatile uint32_t *)ml_io_map(0xae6b800, 0x800);
++	        if (top && ctl0 && dma1 && lm0 && pp0 && dsc0 && dsc1 && intf1) {
++	            IOLog("SWEET FB: TOP HWVER=%#x INTR_EN=%#x INTR_STATUS=%#x\n",
++	                top[0x00/4], top[0x10/4], top[0x14/4]);
++	            IOLog("SWEET FB: CTL0 L0=%#x TOP=%#x FLUSH=%#x\n",
++	                ctl0[0x00/4], ctl0[0x14/4], ctl0[0x18/4]);
++	            IOLog("SWEET FB: DMA1 ADDR=%#x SRC_SIZE=%#x OUT_SIZE=%#x YSTRIDE=%#x FORMAT=%#x\n",
++	                dma1[0x14/4], dma1[0x0c/4], dma1[0x10/4], dma1[0x24/4], dma1[0x30/4]);
++	            IOLog("SWEET FB: DMA1 SCALER_OP=%#x SCALER_PHASE=%#x\n",
++	                dma1[0xb4/4], dma1[0xa8/4]);
++	            IOLog("SWEET FB: LM0 OP_MODE=%#x OUT_SIZE=%#x BLEND0=%#x BLEND1=%#x\n",
++	                lm0[0x00/4], lm0[0x04/4], lm0[0x14/4], lm0[0x18/4]);
++	            IOLog("SWEET FB: PP0 CFG=%#x AUTOREFRESH=%#x SYNC=%#x RD_IRQ=%#x WR_IRQ=%#x\n",
++	                pp0[0x00/4], pp0[0x30/4], pp0[0x04/4], pp0[0x1c/4], pp0[0x20/4]);
++	            IOLog("SWEET FB: DSC0 MODE=%#x PICTURE=%#x SLICE=%#x CHUNK=%#x LAST=%#x\n",
++	                dsc0[0x00/4], dsc0[0x04/4], dsc0[0x10/4], dsc0[0x18/4], dsc0[0x1c/4]);
++	            IOLog("SWEET FB: DSC1 MODE=%#x PICTURE=%#x SLICE=%#x\n",
++	                dsc1[0x00/4], dsc1[0x04/4], dsc1[0x10/4]);
++	            IOLog("SWEET FB: INTF1 TIMING_EN=%#x CONFIG=%#x HS_CTRL=%#x FRAME=%#x\n",
++	                intf1[0x00/4], intf1[0x04/4], intf1[0x08/4], intf1[0x18/4]);
++	        } else {
++	            IOLog("SWEET FB: DPU map failed\n");
++	        }
++	    }
++	    dpuDone = true;
++	}
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
