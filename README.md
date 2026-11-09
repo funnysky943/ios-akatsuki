@@ -1,9 +1,9 @@
-# iOS on the OnePlus 6T (`fajita`)
+# iOS on the Sony Xperia XZ3 (`akatsuki`)
 
-**Apple's iOS 16.7.16 running on a OnePlus 6T.**
+**Apple's iOS 16.7.16 running on a Sony Xperia XZ3.**
 
-This project ports Apple's open-source XNU kernel (the iOS 16 generation) to the OnePlus 6T
-(`fajita`, Qualcomm SDM845 / Snapdragon 845, Adreno 630). On top of it runs the **unmodified
+This project ports Apple's open-source XNU kernel (the iOS 16 generation) to the Sony Xperia XZ3
+(`akatsuki`, Qualcomm SDM845 / Snapdragon 845, Adreno 630). On top of it runs the **unmodified
 iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd,
 SpringBoard and the stock apps.
 
