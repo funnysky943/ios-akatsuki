@@ -7,7 +7,7 @@ This project ports Apple's open-source XNU kernel (the iOS 16 generation) to the
 iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd,
 SpringBoard and the stock apps.
 
-As of **2026-10-25** the phone boots to the **iOS home screen**: unlock works, the
+As of **2026-11-10** the phone boots to the **iOS home screen**: unlock works, the
 touchscreen and the hardware buttons work, and the GUI is drawn by CoreAnimation's software
 renderer. The **GPU bring-up is complete on the kernel side** (power, clocks, firmware,
 secure world, command processor, buffers, fences and the msm-compatible IOKit user client
@@ -22,13 +22,13 @@ that Mesa needs); the userspace graphics stack is the work in progress.
 
 | Area | State |
 | --- | --- |
-| Boot | Stock OnePlus ABL (`fastboot`) → our boot image on `boot_a` → shim → XNU. Header v1 + gzip `Image.gz` + appended DTB; a v2 header or a raw `Image` is rejected by this bootloader |
+| Boot | Stock Sony ABL (`fastboot`) → our boot image on `boot_a` → shim → XNU. Header v1 + gzip `Image.gz` + appended DTB; a v2 header or a raw `Image` is rejected by this bootloader |
 | CPU | 8 of 8 cores via PSCI, GICv3, timers |
 | Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume inside `userdata` |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run (hundreds of processes) |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services, presented as an iPhone X panel; CoreAnimation renders in software |
+| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification centre, Settings |
-| Touch | RMI4 over I²C (`0x20`, SE `0xa90000`) with rail enable; delivered as HID digitizer events |
+| Touch | RMI4 over I²C with rail enable; delivered as HID digitizer events |
 | Buttons | Power and volume up/down (PM8998 through SPMI, usages `0x30`/`0xe9`/`0xea`) |
 | Device identity | iPhone X (`iPhone10,3` / D22) so UIKit picks the gesture UI |
 | Logging | Persistent ring buffer in `userdata` plus a panic flush; pulled over OrangeFox (`tools/sweet-log-pull.sh`) |
@@ -174,6 +174,7 @@ PORTING.md              hardware notes and the bring-up plan
 
 ## Credits
 
+# **- [ios-fajita](https://github.com/edi194/ios-fajita) - Base of this fork, most of the stuff was fully derived from this, huge thanks!**
 - [ios-sweet](https://github.com/dipa-studio/ios-sweet) — the iOS 16 / XNU base this fork
   started from; `docs/IOS16_README.md` keeps that history.
 - HackiOS (`oosexgang`) — the Adreno bring-up ladder the GPU work follows.
