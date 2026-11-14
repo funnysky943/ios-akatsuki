@@ -1,0 +1,38 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 3d3dbcaede42215bf957f2a146e079869d39d8ca..d7e5c9b1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1198,6 +1198,33 @@ handle_uncategorized(arm_saved_state_t *state)
+             return;
+     }
+ 
++    /*
++     * sweetarm64e=1: LDRAB (Key B, immediate offset) is the one pacstrip
++     * leaves unencodable (the cache image at index 838). Emulate the load
++     * without the auth (equivalent to auth succeeding on a valid signed
++     * pointer).
++     */
++    if (sweet_arm64e_enabled() && PSR64_IS_USER64(get_saved_state_cpsr(state)) &&
++        ((instr & 0xFFE00C00) == 0xF8200400 ||   /* LDRAB, offset */
++         (instr & 0xFFE00C00) == 0xF8200C00)) {  /* LDRAB, pre-indexed */
++            uint32_t rt = instr & 0x1F;
++            uint32_t rn = (instr >> 5) & 0x1F;
++            bool wback = (instr >> 11) & 1;
++            int64_t imm9 = ((int64_t)((instr >> 12) & 0x1FF) << 55) >> 55;
++            uint64_t addr = (rn == 31) ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++            addr += imm9 << 3;
++            set_saved_state_reg(state, rt, *(uint64_t *)addr);
++            if (wback) {
++                if (rn == 31) {
++                    set_saved_state_sp(state, addr);
++                } else {
++                    set_saved_state_reg(state, rn, addr);
++                }
++            }
++            set_saved_state_pc(state, get_saved_state_pc(state) + 4);
++            return;
++    }
++
+     /*
+      * Check for GDB breakpoint via illegal opcode.
+      */
