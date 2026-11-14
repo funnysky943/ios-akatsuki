@@ -67,10 +67,18 @@ index 35e5c9add88d24751b123fb9264db559fd973634..3d3dbcaede42215bf957f2a146e07986
  /*
   * Uncategorized exceptions are a catch-all for general execution errors.
   * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
-@@ -1154,6 +1198,14 @@ handle_uncategorized(arm_saved_state_t *state)
+@@ -1154,6 +1198,22 @@ handle_uncategorized(arm_saved_state_t *state)
  		}
  	}
  
++	/*
++	 * Instrumentation: every EL0 uncategorized exception.
++	 */
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
++		printf("SWEET UNCAT: pc=0x%llx instr=0x%08x\n",
++		    (unsigned long long)get_saved_state_pc(state), instr);
++	}
++
 +	/*
 +	 * sweetarm64e=1: FJCVTZS is not implemented by this CPU, emulate it.
 +	 */
