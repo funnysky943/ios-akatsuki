@@ -1,0 +1,20 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 3d3dbcaede42215bf957f2a146e079869d39d8ca..d7e5c9b1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1198,6 +1198,15 @@ handle_uncategorized(arm_saved_state_t *state)
+             }
+     }
+ 
++    /*
++     * Instrumentation: every EL0 uncategorized exception. If the LDRAB is
++     * the blocker, it shows here; if not, the log is empty.
++     */
++    if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
++            printf("SWEET UNCAT: pc=0x%llx instr=0x%08x\n",
++                (unsigned long long)get_saved_state_pc(state), instr);
++    }
++
+     /*
+      * sweetarm64e=1: FJCVTZS is not implemented by this CPU, emulate it.
+      */
