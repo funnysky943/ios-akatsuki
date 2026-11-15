@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,92 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -88,11 +88,15 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	if (sweet_sample_names[0] == '-') {
 +		return;
 +	}
-+	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
++	int sample_delay = 90;
++	int sample_interval = 120;
++	(void)PE_parse_boot_argn("sweetsampledelay", &sample_delay, sizeof(sample_delay));
++	(void)PE_parse_boot_argn("sweetsampleinterval", &sample_interval, sizeof(sample_interval));
++	(void)tsleep(&chan, PZERO, "sweetsmp", sample_delay * hz);
 +	for (int i = 0; i < 10; i++) {
 +		printf("SMP --- sample %d\n", i);
 +		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
-+		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", sample_interval * hz);
 +	}
 +}
 +
