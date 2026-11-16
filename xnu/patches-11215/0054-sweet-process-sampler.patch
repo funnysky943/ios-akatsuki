@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,103 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -99,7 +99,12 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	printf("SMP: DELAY initial woke\n");
 +	for (int i = 0; i < 10; i++) {
 +		printf("SMP --- sample %d\n", i);
++		uint64_t _t0 = mach_absolute_time();
 +		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
++		uint64_t _dt = mach_absolute_time() - _t0;
++		if (_dt > 50ULL * 1000000ULL) {
++			printf("SLOWSAMPLE: proc_iterate %llu ms\n", _dt / 1000000ULL);
++		}
 +		printf("SMP: DELAY loop %d s\n", sample_interval);
 +		delay(sample_interval * hz);
 +		printf("SMP: DELAY loop woke\n");
