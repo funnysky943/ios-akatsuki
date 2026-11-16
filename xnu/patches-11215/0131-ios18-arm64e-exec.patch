@@ -23,7 +23,7 @@ index 2d8067794221b4d945f8aadaf14095ba82a2421e..93b0b20da1c14b4289539f656e36e3d1
 +				 * slice, which keeps fat iOS 16 binaries on their arm64 slice.
 +				 */
 +				if (sweet_arm64e_enabled()) {
-+					printf("EXECGB: arm64e accept pid=%d\n", proc_selfpid());
++					printf("EXECGB: arm64e accept\n");
 +					return 8;
 +				}
 +				break;
@@ -128,7 +128,7 @@ index 44b10f4c95853fc1ebe99ae9c4705870797346b0..1e4fd2e96fe33984de2a9ab3507f9cc4
  		return copyout(&state, arg, sizeof(state));
  	}
 +	if (call == SWEET_AMFI_OP_DYLD_POLICY && sweet_arm64e_enabled() && sweet_proc_is_arm64e(p)) {
-+	printf("EXECAMFI: op0x5a pid=%d\n", proc_selfpid());
++	printf("EXECAMFI: op0x5a\n");
 +		struct sweet_amfi_dyld_policy_req req;
 +		uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
 +		int error = copyin(arg, &req, sizeof(req));
