@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,94 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -69,9 +69,11 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +{
 +	char name[32];
 +	proc_name(proc_pid(p), name, sizeof(name));
++	printf("SMPCB: pid=%d name='%s' wanted=%d\n", proc_pid(p), name, sweet_sample_wanted(name));
 +	if (sweet_sample_wanted(name)) {
 +		task_t task = proc_task(p);
 +		if (task != TASK_NULL) {
++			printf("SMPTASK: name='%s' pid=%d\n", name, proc_pid(p));
 +			sweet_sample_task(name, proc_pid(p), task);
 +		}
 +	}
