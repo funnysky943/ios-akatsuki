@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,104 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -28,7 +28,8 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 + * with tools/sweet-crash.py). A thread blocked in a syscall shows the
 + * syscall stub in pc and its caller in lr/bt.
 + *
-+ * First sample 90 s after start, then every 120 s, 10 samples at most.
++ * First sample 90 s after start, then every 120 s, 10 samples at most
++ * (sweetsampledelay / sweetsampleinterval, in seconds).
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -94,8 +95,8 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	int sample_interval = 120;
 +	(void)PE_parse_boot_argn("sweetsampledelay", &sample_delay, sizeof(sample_delay));
 +	(void)PE_parse_boot_argn("sweetsampleinterval", &sample_interval, sizeof(sample_interval));
-+	printf("SMP: DELAY initial %d s (busy-wait)\n", sample_delay);
-+	delay(sample_delay * hz);
++	printf("SMP: DELAY initial %d s\n", sample_delay);
++	IOSleep(sample_delay * 1000);
 +	printf("SMP: DELAY initial woke\n");
 +	for (int i = 0; i < 10; i++) {
 +		printf("SMP --- sample %d\n", i);
@@ -106,7 +107,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +			printf("SLOWSAMPLE: proc_iterate %llu ms\n", _dt / 1000000ULL);
 +		}
 +		printf("SMP: DELAY loop %d s\n", sample_interval);
-+		delay(sample_interval * hz);
++		IOSleep(sample_interval * 1000);
 +		printf("SMP: DELAY loop woke\n");
 +	}
 +}
