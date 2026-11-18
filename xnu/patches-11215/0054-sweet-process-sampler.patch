@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,123 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -64,6 +64,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +}
 +
 +extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++extern void sweet_log_sync(void);        /* bsd/dev/sweet_ufs.c: flush the console ring now */
 +
 +static int
 +sweet_sample_proc(proc_t p, __unused void *arg)
@@ -93,6 +94,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +		delay(1000000);
 +		if ((i % 5) == 4) {
 +			printf("SMP: wait %d/%d s\n", i + 1, secs);
++			sweet_log_sync();        /* the log flusher's own timer wakes rarely */
 +		}
 +	}
 +}
@@ -113,6 +115,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	printf("SMP: DELAY initial %d s\n", sample_delay);
 +	sweet_wait_secs(sample_delay);
 +	printf("SMP: DELAY initial woke\n");
++	sweet_log_sync();
 +	for (int i = 0; i < 10; i++) {
 +		printf("SMP --- sample %d\n", i);
 +		uint64_t _t0 = mach_absolute_time();
@@ -121,6 +124,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +		if (_dt > 50ULL * 1000000ULL) {
 +			printf("SLOWSAMPLE: proc_iterate %llu ms\n", _dt / 1000000ULL);
 +		}
++		sweet_log_sync();        /* every sample must survive a hang after it */
 +		printf("SMP: DELAY loop %d s\n", sample_interval);
 +		sweet_wait_secs(sample_interval);
 +		printf("SMP: DELAY loop woke\n");
