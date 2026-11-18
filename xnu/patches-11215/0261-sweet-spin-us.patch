@@ -2,10 +2,12 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 2f1a8b3..c0d41e9 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -1286,8 +1286,23 @@
+@@ -1286,8 +1286,25 @@
  	}
  }
  
++extern void machine_delay_until(uint64_t interval, uint64_t deadline);
++
  /*
 + * delay() is not a spin here: for anything above the per-thread spin
 + * threshold it does assert_wait_deadline + thread_block, and timed wakeups
@@ -26,7 +28,7 @@ index 2f1a8b3..c0d41e9 100644
   * for it, so the lines before a step that may hang the SoC survive the
   * reset (sweet_a630.c). Returns at once if the log thread is not running
   * or the caller cannot block.
-@@ -1303,9 +1318,9 @@
+@@ -1303,9 +1320,9 @@
  	}
  	uint64_t target = os_atomic_load(&sweet_log_total, relaxed);
  	wakeup(&sweet_log_chan);
