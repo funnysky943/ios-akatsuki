@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,125 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -28,7 +28,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 + * with tools/sweet-crash.py). A thread blocked in a syscall shows the
 + * syscall stub in pc and its caller in lr/bt.
 + *
-+ * First sample 90 s after start, then every 120 s, 10 samples at most
++ * First sample 90 s after start, then every 120 s, 20 samples at most
 + * (sweetsampledelay / sweetsampleinterval, in seconds).
 + */
 +#include <sys/param.h>
@@ -65,6 +65,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +
 +extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
 +extern void sweet_log_sync(void);        /* bsd/dev/sweet_ufs.c: flush the console ring now */
++extern void sweet_ufs_stats_print(void); /* bsd/dev/sweet_ufs.c: device counters, on demand */
 +
 +static int
 +sweet_sample_proc(proc_t p, __unused void *arg)
@@ -116,8 +117,9 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	sweet_wait_secs(sample_delay);
 +	printf("SMP: DELAY initial woke\n");
 +	sweet_log_sync();
-+	for (int i = 0; i < 10; i++) {
++	for (int i = 0; i < 20; i++) {
 +		printf("SMP --- sample %d\n", i);
++		sweet_ufs_stats_print();
 +		uint64_t _t0 = mach_absolute_time();
 +		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
 +		uint64_t _dt = mach_absolute_time() - _t0;
