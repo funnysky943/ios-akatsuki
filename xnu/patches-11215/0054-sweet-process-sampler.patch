@@ -96,7 +96,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	(void)PE_parse_boot_argn("sweetsampledelay", &sample_delay, sizeof(sample_delay));
 +	(void)PE_parse_boot_argn("sweetsampleinterval", &sample_interval, sizeof(sample_interval));
 +	printf("SMP: DELAY initial %d s\n", sample_delay);
-+	IOSleep(sample_delay * 1000);
++	(void)tsleep(&chan, PZERO, "sweetsample", sample_delay * hz);
 +	printf("SMP: DELAY initial woke\n");
 +	for (int i = 0; i < 10; i++) {
 +		printf("SMP --- sample %d\n", i);
@@ -107,7 +107,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +			printf("SLOWSAMPLE: proc_iterate %llu ms\n", _dt / 1000000ULL);
 +		}
 +		printf("SMP: DELAY loop %d s\n", sample_interval);
-+		IOSleep(sample_interval * 1000);
++		(void)tsleep(&chan, PZERO, "sweetsample", sample_interval * hz);
 +		printf("SMP: DELAY loop woke\n");
 +	}
 +}
