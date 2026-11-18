@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2f1a8b3..c0d41e9 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1286,8 +1286,23 @@
+ 	}
+ }
+ 
+ /*
++ * delay() is not a spin here: for anything above the per-thread spin
++ * threshold it does assert_wait_deadline + thread_block, and timed wakeups
++ * lose whole seconds on this port ("1 s" waits took 10 s or never returned).
++ * Spin the way delay() itself spins, by calling the loop it dispatches to.
++ */
++void
++sweet_spin_us(uint64_t usec)
++{
++	uint64_t interval;
++
++	nanoseconds_to_absolutetime(usec * 1000, &interval);
++	machine_delay_until(interval, mach_absolute_time() + interval);
++}
++
++/*
+  * Flush the console ring to the partition now and wait (bounded, 500 ms)
+  * for it, so the lines before a step that may hang the SoC survive the
+  * reset (sweet_a630.c). Returns at once if the log thread is not running
+  * or the caller cannot block.
+@@ -1303,9 +1318,9 @@
+ 	}
+ 	uint64_t target = os_atomic_load(&sweet_log_total, relaxed);
+ 	wakeup(&sweet_log_chan);
+ 	for (int i = 0; i < 50 && os_atomic_load(&sweet_log_flushed, acquire) < target; i++) {
+-		delay(10000);
++		sweet_spin_us(10000);
+ 	}
+ }
+ 
+ static void
