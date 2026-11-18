@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,166 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -83,16 +83,18 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	return ns / 1000000000ULL;
 +}
 +
++static int sweet_sample_procs;   /* processes seen by the last sample */
++
 +static int
 +sweet_sample_proc(proc_t p, __unused void *arg)
 +{
 +	char name[32];
 +	proc_name(proc_pid(p), name, sizeof(name));
-+	printf("SMPCB: pid=%d name='%s' wanted=%d\n", proc_pid(p), name, sweet_sample_wanted(name));
++	sweet_sample_procs++;
 +	if (sweet_sample_wanted(name)) {
 +		task_t task = proc_task(p);
 +		if (task != TASK_NULL) {
-+			printf("SMPTASK: name='%s' pid=%d\n", name, proc_pid(p));
++			printf("SMPTASK: name='%s' pid=%d t=%llu s\n", name, proc_pid(p), sweet_uptime_s());
 +			sweet_sample_task(name, proc_pid(p), task);
 +		}
 +	}
@@ -139,16 +141,29 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +		printf("SMP --- sample %d t=%llu s\n", i, sweet_uptime_s());
 +		sweet_ufs_stats_print();
 +		uint64_t _t0 = mach_absolute_time();
++		sweet_sample_procs = 0;
 +		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
 +		uint64_t _dt = mach_absolute_time() - _t0;
-+		if (_dt > 50ULL * 1000000ULL) {
-+			printf("SLOWSAMPLE: proc_iterate %llu ms\n", _dt / 1000000ULL);
-+		}
++		printf("SMP: sample %d done t=%llu s procs=%d ms=%llu\n", i, sweet_uptime_s(),
++		    sweet_sample_procs, _dt / 1000000ULL);
 +		sweet_log_sync();        /* every sample must survive a hang after it */
 +		printf("SMP: DELAY loop %d s\n", sample_interval);
 +		sweet_wait_secs(sample_interval);
 +		printf("SMP: DELAY loop woke\n");
 +	}
++	/*
++	 * Timed-wakeup probe last: if the result line never appears, tsleep()
++	 * deadlines do not fire on this port even at kernel priority (every
++	 * diagnostic that slept instead of spinning went silent for 10x its
++	 * timeout or forever).
++	 */
++	printf("SMP: TSLEEP probe 1 s t=%llu s\n", sweet_uptime_s());
++	sweet_log_sync();
++	uint64_t _w0 = mach_absolute_time();
++	tsleep(&sweet_sample_thread, PZERO, "smptsleep", hz);
++	uint64_t _w1 = mach_absolute_time() - _w0;
++	printf("SMP: TSLEEP 1 s took %llu ms t=%llu s\n", _w1 / 1000000ULL, sweet_uptime_s());
++	sweet_log_sync();
 +}
 +
 +/*
