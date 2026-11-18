@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,119 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -81,10 +81,25 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	return PROC_RETURNED;
 +}
 +
++/*
++ * Busy-wait, one second at a time: delay() takes microseconds and needs no
++ * timer wakeup, which tsleep timeouts were not surviving early in boot.
++ * A heartbeat every 5 s shows in the log whether this thread is still alive.
++ */
++static void
++sweet_wait_secs(int secs)
++{
++	for (int i = 0; i < secs; i++) {
++		delay(1000000);
++		if ((i % 5) == 4) {
++			printf("SMP: wait %d/%d s\n", i + 1, secs);
++		}
++	}
++}
++
 +static void
 +sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
 +{
-+	static int chan;
 +	if (!PE_parse_boot_argn("sweetsample", sweet_sample_names, sizeof(sweet_sample_names))) {
 +		strlcpy(sweet_sample_names, "SpringBoard,backboardd", sizeof(sweet_sample_names));
 +	}
@@ -96,7 +111,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	(void)PE_parse_boot_argn("sweetsampledelay", &sample_delay, sizeof(sample_delay));
 +	(void)PE_parse_boot_argn("sweetsampleinterval", &sample_interval, sizeof(sample_interval));
 +	printf("SMP: DELAY initial %d s\n", sample_delay);
-+	(void)tsleep(&chan, PZERO, "sweetsample", sample_delay * hz);
++	sweet_wait_secs(sample_delay);
 +	printf("SMP: DELAY initial woke\n");
 +	for (int i = 0; i < 10; i++) {
 +		printf("SMP --- sample %d\n", i);
@@ -107,7 +122,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +			printf("SLOWSAMPLE: proc_iterate %llu ms\n", _dt / 1000000ULL);
 +		}
 +		printf("SMP: DELAY loop %d s\n", sample_interval);
-+		(void)tsleep(&chan, PZERO, "sweetsample", sample_interval * hz);
++		sweet_wait_secs(sample_interval);
 +		printf("SMP: DELAY loop woke\n");
 +	}
 +}
