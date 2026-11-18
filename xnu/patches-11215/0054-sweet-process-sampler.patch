@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,151 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -28,8 +28,10 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 + * with tools/sweet-crash.py). A thread blocked in a syscall shows the
 + * syscall stub in pc and its caller in lr/bt.
 + *
-+ * First sample 90 s after start, then every 120 s, 20 samples at most
-+ * (sweetsampledelay / sweetsampleinterval, in seconds).
++ * First sample sweetsampledelay seconds after start (default 90), then
++ * every sweetsampleinterval (default 120), sweetsamples times (default 20).
++ * Every line carries the kernel uptime in seconds, so the log itself shows
++ * when the last flush happened.
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -69,6 +71,18 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
 +extern void sweet_spin_us(uint64_t usec);   /* bsd/dev/sweet_ufs.c: delay() sleeps, this spins */
 +
++extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *nsecs);
++
++/* Kernel uptime in seconds: puts every sampler line on the boot timeline. */
++static uint64_t
++sweet_uptime_s(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000000ULL;
++}
++
 +static int
 +sweet_sample_proc(proc_t p, __unused void *arg)
 +{
@@ -89,17 +103,16 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 + * Busy-wait, one second at a time. delay() is not a busy-wait here: it calls
 + * thread_block() for any interval above the spin threshold, and timed wakeups
 + * are unreliable on this port (1 s could take 10 s or never return), so use
-+ * the spin loop delay() dispatches to. A heartbeat every 5 s shows liveness.
++ * the spin loop delay() dispatches to. A heartbeat every second shows
++ * liveness and timestamps the last line before a hang.
 + */
 +static void
 +sweet_wait_secs(int secs)
 +{
 +	for (int i = 0; i < secs; i++) {
 +		sweet_spin_us(1000000);
-+		if ((i % 5) == 4) {
-+			printf("SMP: wait %d/%d s\n", i + 1, secs);
-+			sweet_log_sync();        /* the log flusher's own timer wakes rarely */
-+		}
++		printf("SMP: t=%llu s wait %d/%d\n", sweet_uptime_s(), i + 1, secs);
++		sweet_log_sync();        /* the log flusher's own timer wakes rarely */
 +	}
 +}
 +
@@ -116,12 +129,14 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	int sample_interval = 120;
 +	(void)PE_parse_boot_argn("sweetsampledelay", &sample_delay, sizeof(sample_delay));
 +	(void)PE_parse_boot_argn("sweetsampleinterval", &sample_interval, sizeof(sample_interval));
-+	printf("SMP: DELAY initial %d s\n", sample_delay);
++	printf("SMP: start t=%llu s, DELAY initial %d s\n", sweet_uptime_s(), sample_delay);
 +	sweet_wait_secs(sample_delay);
 +	printf("SMP: DELAY initial woke\n");
 +	sweet_log_sync();
-+	for (int i = 0; i < 20; i++) {
-+		printf("SMP --- sample %d\n", i);
++	int sample_count = 20;
++	(void)PE_parse_boot_argn("sweetsamples", &sample_count, sizeof(sample_count));
++	for (int i = 0; i < sample_count && i < 64; i++) {
++		printf("SMP --- sample %d t=%llu s\n", i, sweet_uptime_s());
 +		sweet_ufs_stats_print();
 +		uint64_t _t0 = mach_absolute_time();
 +		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
