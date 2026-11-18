@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9b7c4d2..2f1a8b3 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -60,8 +60,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* osfmk/arm/cpu_data.h, not exported to the BSD layer */
+ extern int get_preemption_level(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+ static void sweet_ufs_selftest_start(void);
+@@ -1320,9 +1321,10 @@
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
+ 	if (sweet_log_secs == 0 || sweet_log_secs > 60) {
+ 		sweet_log_secs = SWEET_LOG_SECS;
+ 	}
+-	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
++	/* BASEPRI_KERNEL: a priority-0 flusher was starved for most of the boot. */
++	if (kernel_thread_start_priority(sweet_log_thread, NULL, 81, &thread) == KERN_SUCCESS) {
+ 		os_atomic_store(&sweet_log_running, true, release);
+ 		thread_deallocate(thread);
+ 	}
+ }

@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789994da910
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,134 @@
 +/*
 + * SWEET process sampler: where is a daemon stuck?
 + *
@@ -66,6 +66,7 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
 +extern void sweet_log_sync(void);        /* bsd/dev/sweet_ufs.c: flush the console ring now */
 +extern void sweet_ufs_stats_print(void); /* bsd/dev/sweet_ufs.c: device counters, on demand */
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
 +
 +static int
 +sweet_sample_proc(proc_t p, __unused void *arg)
@@ -133,11 +134,19 @@ index 0000000000000000000000000000000000000000..564a0d3b04a725ab6043ddddb30d0789
 +	}
 +}
 +
++/*
++ * Normal kernel priority (BASEPRI_KERNEL): kernel_thread_start() makes a
++ * priority-0 thread, which the boot starved for most of a minute (the first
++ * heartbeat only showed up 60 s in), so every sample was late.
++ */
++#define SWEET_SAMPLE_PRI 81
++
 +void
 +sweet_sample_start(void)
 +{
 +	thread_t thread;
-+	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start_priority(sweet_sample_thread, NULL, SWEET_SAMPLE_PRI,
++	    &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}
 +}
