@@ -1,0 +1,174 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -20,16 +20,9 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ /* stage 8: buffer allocation and cache attributes */
+-#include <vm/pmap.h>
+-#include <vm/vm_kern.h>
+-#include <arm/memory_types.h>
+ #include <sys/conf.h>
+ #include <sys/ioccom.h>
+ #include <miscfs/devfs/devfs.h>
+-/* The arm pmap is not exported to the BSD layer on this port (sweet_ufs.c
+- * declares pmap_find_phys the same way). */
+-extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+-extern void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_gpu_probe(void);
+@@ -356,6 +349,7 @@
+ #define GPU_BO_MAX             8u
+ #define GPU_VA_BASE            0x80020000u   /* after the 0149/0150 test pages */
+ #define GPU_BO_MAX_BYTES       0x100000u
++#define GPU_ARENA_BYTES        0x100000u   /* the sweetfw2 blob: 1 MiB */
+ /* stage 8e: the device node and its ABI (selector numbers as in Linux msm) */
+ #define SWEET_GPU_IOCTL_INFO       0x70u
+ #define SWEET_GPU_IOCTL_GEM_NEW    0x42u
+@@ -421,16 +415,42 @@
+ static struct gpu_bo gpu_bos[GPU_BO_MAX];
+ static uint32_t gpu_va_next;         /* bump allocator, one guard page, no reuse */
+ static uint32_t next_handle = 1;
++
++/* the buffer arena (a payload blob) */
++static vm_offset_t gpu_arena;
++static uint64_t gpu_arena_pa;
++static uint32_t gpu_arena_size;
++static uint32_t gpu_arena_used;
+ static vm_offset_t gpu_pt_blob;      /* where the page tables live */
+ 
+-static void
++static bool
+ gpu_bo_init(vm_offset_t blob)
+ {
++	char arg[64];
++	uint64_t pa = 0, size = 0;
++
+ 	gpu_pt_blob = blob;
+ 	gpu_va_next = GPU_VA_BASE;
++	gpu_arena_used = 0;
+ 	for (unsigned i = 0; i < GPU_BO_MAX; i++) {
+ 		gpu_bos[i].used = false;
+ 	}
++	if (!PE_parse_boot_argn("sweetfw2", arg, sizeof(arg)) ||
++	    !gpu_parse_range(arg, &pa, &size) || size < GPU_ARENA_BYTES) {
++		printf("SWEET GPU: no sweetfw2 arena of %u KiB; buffers unavailable\n",
++		    GPU_ARENA_BYTES / 1024);
++		return false;
++	}
++	gpu_arena_pa = pa;
++	gpu_arena_size = GPU_ARENA_BYTES;
++	gpu_arena = ml_io_map((vm_offset_t)pa, GPU_ARENA_BYTES);
++	if (gpu_arena == 0) {
++		printf("SWEET GPU: cannot map the buffer arena\n");
++		return false;
++	}
++	printf("SWEET GPU: buffer arena %u KiB at %#llx -> %#llx\n", GPU_ARENA_BYTES / 1024,
++	    (unsigned long long)pa, (uint64_t)gpu_arena);
++	return true;
+ }
+ 
+ /*
+@@ -466,13 +486,19 @@
+ 	return true;
+ }
+ 
++/*
++ * Buffers live in a blob from the payload: contiguous, never touched by the pmap,
++ * reached uncached through ml_io_map - the same memory the GMU firmware, the ring,
++ * the SQE and the page tables come from, all of which the CP reads and writes
++ * through the SMMU.
++ */
+ static struct gpu_bo *
+ gpu_bo_alloc(vm_size_t size)
+ {
+ 	struct gpu_bo *bo = NULL;
+ 
+ 	size = round_page(size);
+-	if (size == 0 || size > GPU_BO_MAX_BYTES) {
++	if (size == 0 || size > GPU_BO_MAX_BYTES || gpu_arena == 0) {
+ 		return NULL;
+ 	}
+ 	for (unsigned i = 0; i < GPU_BO_MAX; i++) {
+@@ -485,33 +511,21 @@
+ 		printf("SWEET GPU: bo: out of descriptors\n");
+ 		return NULL;
+ 	}
+-
+-	vm_offset_t kva = 0;
+-	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET GPU: bo: %lu bytes, contiguous allocation failed\n",
+-		    (unsigned long)size);
++	if (gpu_arena_used + size > gpu_arena_size) {
++		printf("SWEET GPU: bo: %lu bytes do not fit the %u KiB arena (%u used)\n",
++		    (unsigned long)size, gpu_arena_size / 1024, gpu_arena_used);
+ 		return NULL;
+ 	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
+-	if (pn == 0) {
+-		kmem_free(kernel_map, kva, size);
+-		return NULL;
+-	}
+-	for (vm_size_t o = 0; o < size; o += 0x1000) {
+-		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + o)) != pn + o / 0x1000) {
+-			printf("SWEET GPU: bo: %lu bytes not physically contiguous\n",
+-			    (unsigned long)size);
+-			kmem_free(kernel_map, kva, size);
+-			return NULL;
+-		}
+-		/* The GPU's PTEs are non-cacheable: a cacheable alias would go
+-		 * invisible to the CP and stale lines would overwrite its writes. */
+-		pmap_set_cache_attributes(pn + o / 0x1000, VM_WIMG_WCOMB);
++
++	uint32_t off = gpu_arena_used;
++	gpu_arena_used = off + size;
++	volatile uint32_t *zero = (volatile uint32_t *)(gpu_arena + off);
++	for (uint32_t i = 0; i < size / 4; i++) {
++		zero[i] = 0;
+ 	}
+ 
+-	bo->kva = kva;
+-	bo->pa = (uint64_t)pn << PAGE_SHIFT;
++	bo->kva = gpu_arena + off;
++	bo->pa = gpu_arena_pa + off;
+ 	bo->size = size;
+ 	bo->va = gpu_va_next;
+ 	bo->handle = next_handle++;
+@@ -520,11 +534,10 @@
+ 
+ 	if (!gpu_pt_map(bo->va, bo->pa, size)) {
+ 		bo->used = false;
+-		kmem_free(kernel_map, kva, size);
+ 		return NULL;
+ 	}
+-	printf("SWEET GPU: bo: %lu bytes pa %#llx va %#x kva %#lx\n", (unsigned long)size,
+-	    (unsigned long long)bo->pa, bo->va, (unsigned long)kva);
++	printf("SWEET GPU: bo: %lu bytes arena+%#x pa %#llx va %#x handle %u\n",
++	    (unsigned long)size, off, (unsigned long long)bo->pa, bo->va, bo->handle);
+ 	return bo;
+ }
+ 
+@@ -540,8 +553,8 @@
+ 		l3[((bo->va + o) >> 12) & 0x1ff] = 0;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	kmem_free(kernel_map, bo->kva, bo->size);
+-	printf("SWEET GPU: bo: freed va %#x (%lu bytes)\n", bo->va, (unsigned long)bo->size);
++	printf("SWEET GPU: bo: freed va %#x handle %u (%lu bytes)\n", bo->va, bo->handle,
++	    (unsigned long)bo->size);
+ 	bo->used = false;
+ }
+ 
+@@ -1260,7 +1273,10 @@
+ 	static const uint32_t v[3] = { 0xb0010001u, 0xb0010002u, 0xb0010003u };
+ 	unsigned n = 0;
+ 
+-	gpu_bo_init(blob);
++	if (!gpu_bo_init(blob)) {
++		printf("SWEET GPU: bo test: no arena, skipping\n");
++		return false;
++	}
+ 	struct gpu_bo *cmd = gpu_bo_alloc(0x4000);
+ 	struct gpu_bo *dst = gpu_bo_alloc(0x1000);
+ 	if (cmd == NULL || dst == NULL) {

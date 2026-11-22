@@ -1,0 +1,555 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6672caa..d455e0d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,23 +110,14 @@ bsd/dev/unix_startup.c			standard
+ 
+ bsd/dev/monotonic.c optional monotonic
+ bsd/dev/redwood_input.c		standard
++bsd/dev/sweet_touch.c		standard
++bsd/dev/sweet_keys.c		standard
++bsd/dev/sweet_rpmh.c		standard
++bsd/dev/sweet_gpu.c		standard
++bsd/dev/sweet_spmi.c		standard
+ bsd/dev/redwood_virtio_input.c	standard
+ bsd/dev/redwood_goodix.c	standard
+ bsd/dev/redwood_buttons.c	standard
+-bsd/dev/mi8_fts.c	standard
+-bsd/dev/mi8_bt.c	standard
+-bsd/dev/mi8_adreno.c	standard
+-bsd/dev/mi8_rproc.c	standard
+-bsd/dev/mi8_glink.c	standard
+-bsd/dev/mi8_audio.c	standard
+-bsd/dev/mi8_audio_sink.c	standard
+-bsd/dev/mi8_audio_ring.c	standard
+-bsd/dev/mi8_audio_pcm.c	standard
+-bsd/dev/mi8_tas2557.c	standard
+-bsd/dev/mi8_audio_smmu.c	standard
+-bsd/dev/mi8_hostsvc_k.c	standard
+-bsd/dev/mi8_wlfw_k.c	standard
+-bsd/dev/mi8_wlfw_v01.c	standard
+ bsd/dev/redwood_battery.c	standard
+ bsd/dev/redwood_ufs.c	standard
+ bsd/dev/redwood_ufshc.c	standard
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
+index 0000000..f66d667
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,35 @@
++/*
++ * Adreno 630 GPU probe for akatsuki (SDM845)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define GPU_PA       0x05000000u
++#define GPU_GCC      0x00100000u
++
++static uint32_t gpu_rd(vm_offset_t base, uint32_t off)
++{
++	if (!base) return 0;
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++void sweet_gpu_probe(void)
++{
++	int level = 0;
++	(void)PE_parse_boot_argn("adreno", &level, sizeof(level));
++	if (level < 1) return;
++	
++	vm_offset_t gcc = ml_io_map(GPU_GCC, 0x20000);
++	if (gcc) {
++		printf("SWEET GPU: probe level %d, gcc pll-vote=%#x\n", level, gpu_rd(gcc, 0x52000));
++	}
++}
++#endif
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+new file mode 100644
+index 0000000..7d42e54
+--- /dev/null
++++ b/bsd/dev/sweet_keys.c
+@@ -0,0 +1,156 @@
++/*
++ * Minimal PM8998 keys driver for akatsuki (Sony Xperia XZ3).
++ * Power key: PMIC PON, Volume keys: PM8998 GPIO5/6 via SPMI
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++void sweet_keys_init(void);
++
++#define KEYS_CORE_PA     0x0c440000u
++#define KEYS_OBS_PA      0x0e600000u
++#define KEYS_CNFG_PA     0x0c40a000u
++#define KEYS_PON_RT      0x0810u
++#define KEYS_GPIO_RT     0xc110u
++#define KEYS_NO_APID     0xffffu
++
++static vm_offset_t keys_core, keys_obs, keys_cnfg;
++static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint32_t keys_version, keys_last_status;
++static bool keys_started;
++static int keys_sleep_chan;
++
++static uint32_t
++keys_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint16_t
++keys_find_apid(uint16_t ppid, uint32_t count)
++{
++	uint16_t found = KEYS_NO_APID;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == KEYS_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static bool
++keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	if (apid == KEYS_NO_APID) {
++		return false;
++	}
++	uint32_t off = 0x80u * apid;
++	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(keys_obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		keys_last_status = keys_rd(keys_obs, off + 0x08u);
++		if (keys_last_status & 1u) {
++			if (keys_last_status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++keys_wait(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++keys_thread(void *arg, wait_result_t result)
++{
++	int state[3] = {0, 0, 0};
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint8_t val;
++		/* Power key (PON register) */
++		if (keys_read(keys_pon_apid, KEYS_PON_RT, &val)) {
++			bool down = (val & 1u) != 0;
++			if (down != state[0]) {
++				state[0] = down;
++				sweet_hid_key(0, down);
++			}
++		}
++		/* Volume up (PM8998 GPIO5) */
++		if (keys_read(keys_gpio_apid, KEYS_GPIO_RT, &val)) {
++			bool down = (val & (1u << 5)) != 0;
++			if (down != state[1]) {
++				state[1] = down;
++				sweet_hid_key(down ? 1 : 2, down);
++			}
++		}
++		/* Volume down (PM8998 GPIO6) */
++		if (keys_read(keys_gpio_apid, KEYS_GPIO_RT, &val)) {
++			bool down = (val & (1u << 6)) != 0;
++			if (down != state[2]) {
++				state[2] = down;
++				sweet_hid_key(down ? 2 : 1, down);
++			}
++		}
++		if (++errors >= 100) {
++			keys_wait();
++			errors = 0;
++		}
++	}
++}
++
++void
++sweet_keys_init(void)
++{
++	if (keys_started) return;
++	
++	keys_core = ml_io_map(KEYS_CORE_PA, 0x10000);
++	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
++	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x10000);
++	
++	if (!keys_core || !keys_obs || !keys_cnfg) {
++		return;
++	}
++	
++	keys_pon_apid = keys_find_apid(0, 32);
++	keys_gpio_apid = keys_find_apid(4, 32);
++	
++	if (keys_pon_apid == KEYS_NO_APID || keys_gpio_apid == KEYS_NO_APID) {
++		return;
++	}
++	
++	keys_started = true;
++	kern_return_t kr = kernel_thread_start(keys_thread, NULL, NULL);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+new file mode 100644
+index 0000000..b130e8e
+--- /dev/null
++++ b/bsd/dev/sweet_rpmh.c
+@@ -0,0 +1,66 @@
++/*
++ * Minimal RPMh driver for akatsuki - enables PM8998 LDO28 (touch VDD 3.008V)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++
++#define RH_RSC_PA       0x18220000u
++#define RH_TCS_PA       0x18220d00u
++#define RH_TCS_SIZE     0x3000u
++#define RH_ACTIVE_N     2u
++
++static vm_offset_t rh_rsc, rh_tcs;
++static unsigned rh_lock;
++
++static uint32_t rh_read(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void rh_write(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool rh_sync(uint32_t off, uint32_t value)
++{
++	rh_write(rh_tcs, off, value);
++	for (unsigned i = 0; i < 1000; ++i) {
++		if (rh_read(rh_tcs, off) == value) return true;
++		delay(1);
++	}
++	return false;
++}
++
++int sweet_rpmh_vreg_enable(const char *res, unsigned mv)
++{
++	if (!res || (strcmp(res, "ldoa28") && strcmp(res, "ldoc11"))) return EINVAL;
++	if (mv < 2856 || mv > 3400) return EINVAL;
++	
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++	
++	rh_rsc = ml_io_map(RH_RSC_PA, 0x10000);
++	rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
++	if (!rh_rsc || !rh_tcs) {
++		__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++		return ENXIO;
++	}
++	
++	rh_write(rh_tcs, 0x14, 0x3);
++	__asm__ volatile("dsb osh" ::: "memory");
++	
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+new file mode 100644
+index 0000000..2a581ee
+--- /dev/null
++++ b/bsd/dev/sweet_spmi.c
+@@ -0,0 +1,33 @@
++/*
++ * Minimal SPMI driver for akatsuki - PMIC register access
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SPMI_CORE_PA    0x0c440000u
++#define SPMI_OBS_PA     0x0e600000u
++#define SPMI_CNFG_PA    0x0c40a000u
++
++static vm_offset_t spmi_core, spmi_obs, spmi_cnfg;
++
++int sweet_spmi_read(uint16_t sid, uint16_t addr, uint8_t *val)
++{
++	if (!spmi_core) {
++		spmi_core = ml_io_map(SPMI_CORE_PA, 0x10000);
++		spmi_obs = ml_io_map(SPMI_OBS_PA, 0x10000);
++		spmi_cnfg = ml_io_map(SPMI_CNFG_PA, 0x10000);
++		if (!spmi_core || !spmi_obs || !spmi_cnfg) return ENXIO;
++	}
++	return ENXIO;
++}
++
++int sweet_spmi_write(uint16_t sid, uint16_t addr, uint8_t val)
++{
++	return ENXIO;
++}
++#endif
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+new file mode 100644
+index 0000000..79b65df
+--- /dev/null
++++ b/bsd/dev/sweet_touch.c
+@@ -0,0 +1,157 @@
++/*
++ * Atmel mXT640U touch driver for akatsuki (Sony Xperia XZ3).
++ * I2C 0x4a on QUPv3 SE5 (i2c@894000), ATTN GPIO125, RESET GPIO99, VDDIO GPIO133
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_touch_init(void);
++
++#define XZ3_GCC_PA       0x00100000u
++#define XZ3_GCC_VOTE     0x5200cu
++#define XZ3_VOTE_BITS    ((1u << 6) | (1u << 7) | (1u << 15) | (1u << 16))
++#define XZ3_SE5_CBCR     0x17738u
++#define XZ3_SE5_CMD      0x1773cu
++#define XZ3_SE5_CFG      0x17740u
++#define XZ3_TLMM_BASE    0x03400000u
++#define XZ3_TLMM_WEST_OFS  0x100000u
++#define XZ3_TLMM_NORTH_OFS 0x500000u
++#define XZ3_TLMM_SIZE    0xc00000u
++#define XZ3_SE_PA        0x0894000u
++#define XZ3_TS_ADDR      0x4au
++#define XZ3_GPIO_ATTN    125u
++#define XZ3_GPIO_RESET   99u
++#define XZ3_GPIO_VIO     133u
++
++#define TOUCH_MAX        10u
++#define TOUCH_MXT        3
++
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++
++static struct {
++	vm_offset_t se, gcc, gpio, gpio_s;
++	bool started, dead, probing;
++	int kind, irq_hint;
++	uint32_t irq_status, irq_last, active;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++} st;
++static int touch_sleep_chan;
++
++static uint32_t touch_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void touch_gpio_at(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
++{
++	uint32_t off = pin * 0x1000u;
++	uint32_t cfg = touch_rd(base, off);
++	if (out) {
++		touch_wr(base, off + 4u, (touch_rd(base, off + 4u) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	touch_wr(base, off, cfg);
++}
++
++static void touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool xz3_clocks(void)
++{
++	touch_wr(st.gcc, XZ3_GCC_VOTE, touch_rd(st.gcc, XZ3_GCC_VOTE) | XZ3_VOTE_BITS);
++	uint32_t cfg = touch_rd(st.gcc, XZ3_SE5_CFG);
++	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++	touch_wr(st.gcc, XZ3_SE5_CFG, cfg);
++	touch_wr(st.gcc, XZ3_SE5_CMD, touch_rd(st.gcc, XZ3_SE5_CMD) | 0x3u);
++	if (!touch_wait_clear(st.gcc, XZ3_SE5_CMD, 1u)) return false;
++	for (unsigned i = 0; i < 200; ++i) {
++		if (!(touch_rd(st.gcc, XZ3_SE5_CBCR) & (1u << 31))) return true;
++		touch_wait(1);
++	}
++	return false;
++}
++
++static void touch_xz3_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20;
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	touch_wait(delay_s * 1000u);
++	
++	st.gcc = ml_io_map(XZ3_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(XZ3_TLMM_BASE, XZ3_TLMM_SIZE);
++	st.gpio_s = st.gpio;
++	st.se = ml_io_map(XZ3_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.se) return;
++	
++	touch_gpio_at(st.gpio + XZ3_TLMM_NORTH_OFS, XZ3_GPIO_RESET, 0, 3, 0, true, false);
++	touch_gpio_at(st.gpio + XZ3_TLMM_NORTH_OFS, XZ3_GPIO_VIO, 0, 3, 0, true, true);
++	touch_gpio_at(st.gpio + XZ3_TLMM_WEST_OFS, XZ3_GPIO_ATTN, 0, 3, 0, false, false);
++	touch_wait(150);
++	touch_gpio_at(st.gpio + XZ3_TLMM_NORTH_OFS, XZ3_GPIO_RESET, 0, 3, 0, true, true);
++	touch_wait(200);
++	// TODO: mux I2C pins
++	
++	if (!xz3_clocks()) return;
++	// TODO: I2C communication with mXT640U
++	
++	while (!st.dead) touch_wait(1000);
++}
++
++static void touch_thread(void *arg, wait_result_t result)
++{
++	int ts_mode = 0;
++	(void)PE_parse_boot_argn("sweetts", &ts_mode, sizeof(ts_mode));
++	void (*start)(void *, wait_result_t) = NULL;
++	if (ts_mode == 2) start = touch_xz3_thread;
++	if (start) {
++		kern_return_t kr = kernel_thread_start(start, NULL, NULL);
++		if (kr == KERN_SUCCESS) thread_deallocate(kr);
++	}
++}
++
++void sweet_touch_init(void) {
++	if (st.started) return;
++	st.started = true;
++	kern_return_t kr = kernel_thread_start(touch_thread, NULL, NULL);
++	if (kr == KERN_SUCCESS) thread_deallocate(kr);
++}
++#endif
+diff --git a/iokit/conf/files b/iokit/conf/files
+index 39cfe78..24c0bda 100644
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -83,6 +83,8 @@ iokit/Kernel/GenericARMPE.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
+ iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
++iokit/Kernel/SweetScalerStubClient.cpp	optional iokitcpp
++iokit/Kernel/AppleM2ScalerCSCDriver.cpp	optional iokitcpp
+ iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
+ iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
+ iokit/Kernel/RedwoodBT.cpp			optional iokitcpp
+diff --git a/pexpert/arm/pe_bootargs.c b/pexpert/arm/pe_bootargs.c
+index 49e4ff0..70b59e0 100644
+--- a/pexpert/arm/pe_bootargs.c
++++ b/pexpert/arm/pe_bootargs.c
+@@ -91,6 +91,27 @@ PE_init_boot_defaults(void)
+ 		strlcat(effective_args, dipper_defaults[i].value, sizeof(effective_args));
+ 	}
+ 	dipper_args_ready = TRUE;
++
++/* akatsuki (Sony Xperia XZ3) defaults */
++static const struct {
++	const char *name;
++	const char *value;
++} akatsuki_defaults[] = {
++	{ "sweetts", "2" },
++	{ "sweettouchdelay", "20" },
++	{ "sweetkeys", "1" },
++	{ "rpmhrsc", "0x179e0000" },
++	{ "rpmhtcs", "0x179e0d00" },
++	{ "adreno", "1" },
++	{ "fb_native", "2" },
++	{ "fb_flip", "1" },
++	{ "sweetfb_hz", "10" },
++	{ "sweetecon", "1" },
++	{ "sweetfb_noconsole", "1" },
++	{ "sweetlog", "1" },
++};
++#define AKATSUKI_DEFAULT_COUNT (sizeof(akatsuki_defaults) / sizeof(akatsuki_defaults[0]))
++
+ }
+ 
+ void

@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -958,7 +958,13 @@
+ 		NEED(struct sweet_msm_submitqueue);
+ 		IOLockLock(gAdrenoLock);
+ 		ret = kIOReturnNoResources;
+-		if (r.queue.prio != 0 || r.queue.flags != 0) {
++		/*
++		 * One ring, so there are no priority levels: freedreno asks for prio 1 unconditionally
++		 * (fd_pipe_new -> fd_pipe_new2(dev, id, 1)) and its own comment calls that the default.
++		 * Keep the preempt hint bit allowed too, refuse anything else.
++		 */
++		IOLog("SWEET ADRENO: submitqueue_new flags %#x prio %u\n", r.queue.flags, r.queue.prio);
++		if ((r.queue.flags & ~1u) != 0) {
+ 			ret = kIOReturnBadArgument;
+ 		} else {
+ 			for (uint32_t id = 1; id < QUEUE_IDS; id++) {

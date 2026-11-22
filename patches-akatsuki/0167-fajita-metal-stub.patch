@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -216,11 +216,21 @@
+ 	uint32_t accelOn = 1;
+ 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
++		/*
++		 * C1: name a Metal plugin here. Metal matches IOServiceMatching(
++		 * "IOAcceleratorES"), reads MetalPluginName, loads that bundle from
++		 * /System/Library/Extensions and asks its class (_MTLDevice subclass,
++		 * or MetalPluginClassName) to -initWithAcceleratorPort:. Until this
++		 * patch the service had no name, so Metal found it and passed it over.
++		 */
++		bool named = accel->setProperty("MetalPluginName", "SweetMetalProbe") &&
++		    accel->setProperty("MetalPluginClassName", "SweetMetalDevice");
+ 		accel->setName("sgx");
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+-			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++			IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe"
++			    " (properties set: %s)\n", named ? "yes" : "NO");
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);

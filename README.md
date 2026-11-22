@@ -1,186 +1,152 @@
-# iOS on the Sony Xperia XZ3 (`akatsuki`)
+# dipper-xnu
 
-**Apple's iOS 16.7.16 running on a Sony Xperia XZ3.**
+**English** | [简体中文](docs/zh-CN/README.md)
 
-This project ports Apple's open-source XNU kernel (the iOS 16 generation) to the Sony Xperia XZ3
-(`akatsuki`, Qualcomm SDM845 / Snapdragon 845, Adreno 630). On top of it runs the **unmodified
-iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd,
-SpringBoard and the stock apps.
+**Experimental / Work in Progress**
 
-As of **2026-11-10** the phone boots to the **iOS home screen**: unlock works, the
-touchscreen and the hardware buttons work, and the GUI is drawn by CoreAnimation's software
-renderer. The **GPU bring-up is complete on the kernel side** (power, clocks, firmware,
-secure world, command processor, buffers, fences and the msm-compatible IOKit user client
-that Mesa needs); the userspace graphics stack is the work in progress.
+Experimental XNU (`8796.121.2`, Darwin `22.5.0`) and iOS `16.5` (`20F66`) port for **Xiaomi Mi 8 (`dipper`)**, Qualcomm Snapdragon 845 (`SDM845`).
 
-> Experimental bring-up, not a usable phone OS. Wi-Fi, Bluetooth, the modem, the camera and
-> hardware acceleration are not there yet, Apple's security model is mostly switched off,
-> and the iOS root lives in the `userdata` partition — so **flashing it erases whatever is
-> in `userdata`**.
+Built on the [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) foundation, with `dipper`-specific bring-up for UEFI/loader boot, display, touch, Adreno 630 GPU, WCN3990 Wi-Fi & Bluetooth, and internal speaker audio. It boots to the SpringBoard home screen with GPU rendering, touch, Wi-Fi networking, Bluetooth pairing, and speaker output.
 
-## What works
+This project is still under active development and is **not** ready for daily use.
 
-| Area | State |
+## Recent Updates · 2026-11-19
+
+- **GPU & display smoothness**: Enabled Adreno 630 GMEM tile rendering, zero-copy DPU scanout (`fb_native=2`), and batched GPU SMMU page-table mapping by default, eliminating frame-copy and cache-flush animation stutter.
+- **Native Wi-Fi & Bluetooth**: Replaced userspace Bluetooth and Wi-Fi status-bar shims with native kernel IOKit drivers (`RedwoodBT`, `RedwoodWLAN`) and fixed native SpringBoard Wi-Fi signal bar updates.
+- **Dynamic frequency scaling**: Added touch- and GPU-driven dynamic CPU/DDR frequency scaling (`825 MHz` / DDR `2/16` idle under the `66 °C` thermal ceiling).
+- **Speaker audio & volume HUD**: Fixed TAS2557 I2C check timing for faster wakeups, and fixed the muted volume HUD via standard HID ringer state reporting.
+- **Sideload, teardown & tooling**: Added `/apps` union-mount sideloading, orderly warm teardown for resident subsystems, and read-only live logging (`tools/tests/device-log.py`).
+
+Full change history and device test metrics: [CHANGELOG.md](CHANGELOG.md) and [VALIDATION.md](docs/validation/VALIDATION.md).
+
+## Hardware & Boot Chain
+
+| Component | Target |
 | --- | --- |
-| Boot | Stock Sony ABL (`fastboot`) → our boot image on `boot_a` → shim → XNU. Header v1 + gzip `Image.gz` + appended DTB; a v2 header or a raw `Image` is rejected by this bootloader |
-| CPU | 8 of 8 cores via PSCI, GICv3, timers |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume inside `userdata` |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run (hundreds of processes) |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification centre, Settings |
-| Touch | RMI4 over I²C with rail enable; delivered as HID digitizer events |
-| Buttons | Power and volume up/down (PM8998 through SPMI, usages `0x30`/`0xe9`/`0xea`) |
-| Device identity | iPhone X (`iPhone10,3` / D22) so UIKit picks the gesture UI |
-| Logging | Persistent ring buffer in `userdata` plus a panic flush; pulled over OrangeFox (`tools/sweet-log-pull.sh`) |
-| GPU (kernel) | Full Adreno 630 bring-up: power, clocks, ARC/PDC, GMU firmware + HFI, SMMU (two contexts), the signed zap through TrustZone, command processor, buffers, fences, keep-alive, msm-compatible IOKit user client |
+| Device Codename | `dipper` (Xiaomi Mi 8) |
+| SoC | Qualcomm Snapdragon 845 (`SDM845`) |
+| GPU | Adreno 630 (`A630`) |
+| Wi-Fi & Bluetooth | Qualcomm WCN3990 |
+| Speaker Amp | TI TAS2557 (Quaternary MI2S + I2C) |
+| Kernel | XNU `8796.121.2` (Darwin `22.5.0`) |
+| Userspace | iOS `16.5` (Build `20F66`) |
 
-## What does not work (yet)
+Boot flow:
 
-- **Hardware acceleration**: the kernel side is done; Mesa/freedreno and Chlorophyll (Metal)
-  are not built for this root yet. Rendering is CPU-only, so the UI is slow.
-- **Wi-Fi / Bluetooth / modem / camera**: no drivers.
-- **Wallpaper (PosterBoard)**: crashes without a working graphics stack; expected to resolve
-  with the Metal path.
-- **Time**: the clock starts at 1969, so anything checking certificates (TLS, activation)
-  sees an invalid date.
-- **Apple security**: AMFI, sandbox and code signing are permissive stand-ins. Do not treat
-  this as a secure iOS.
-
-## How it boots
-
-1. The bootloader loads `boot_a` with our shim, which sets up a minimal EL2/EL1
-   environment and jumps into XNU.
-2. The shim passes XNU a payload: the kernel, the ADT (device tree), the boot arguments and
-   firmware blobs announced as `sweetfwN=<pa>:<size>` (`a630_gmu.bin`, the GMU memory block,
-   the buffer arena, the page-table pool).
-3. XNU mounts the HFS+ root from `userdata` and starts `/sbin/launchd`.
-
-## How to do it yourself
-
-### 0. Back up the phone
-
-`userdata` holds the iOS root. Everything else (bootloaders, recovery, modem, `persist`) is
-left alone by this project, but keep a backup anyway and read this file to the end first.
-
-### 1. Build the kernel
-
-The kernel is built by GitHub Actions (`.github/workflows/xnu.yml`) from the patch series in
-`xnu/patches/`; the artifact is `kernel.development.sweet`. Locally the series applies to the
-same base tree:
-
-```bash
-python3 tools/check-hunk-counts.py          # sanity: every patch still applies in order
-for p in xnu/patches/0*.patch; do patch -p1 -s < "$p"; done
+```text
+Stock dipper bootloaders -> edk2-sdm845 UEFI -> xnuloader -> XNU -> iOS 16.5 userspace
 ```
 
-### 2. Build the iOS root image
+## Feature Status (2026-11-19)
 
-`tools/mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img` builds a 16 GiB HFS+ image from
-the iPhone X IPSW (the OS, SystemOS and AppOS disk images), including the shared cache and
-the stock apps. `tools/mk-root-with-gpu.sh --in-place IMG` then adds this project's
-userspace pieces to an existing image:
+Most peripheral checks below were recorded on the pre-repartition test layout, with newer items (Bluetooth, speaker audio, native Wi-Fi status bar/LQM, dynamic CPU/DDR scaling, optional render scaling, persistent `/private/var`) verified separately in recent boots; full post-repartition regression and long-term stability remain to be tested.
 
-- `/usr/local/bin/sweetgputest` and `/usr/local/bin/sweet-iokit-test`
-- LaunchDaemons `org.sweet.gputest` and `org.sweet.iokittest` (output on `/dev/console`)
-- `/System/Library/Extensions/`, where the Metal driver bundle will live
+| Feature | Status | Notes |
+| --- | --- | --- |
+| System boot | Works | Reaches iOS 16.5 SpringBoard home screen |
+| Display & GPU | Partly | Mesa / freedreno drives A630 with GMEM tile rendering, `fb_native=2` WC zero-copy scanout (`59 FPS` active), dynamic CPU/DDR governor, and batched SMMU mapping; render-thread big-core affinity and exit recovery need work |
+| Touch | Works | FTS touch input working |
+| Brightness & Lock/Wake | Works | Settings / Control Center brightness and lock/wake verified |
+| Volume buttons | Works | Standard HID Telephony Ring Switch (`0x0b`/`0x2e`) fixes the muted HUD overlay; buttons and slider adjust volume |
+| Torch & Haptics | Works | Torch toggle and haptics work; torch brightness steps are subtle |
+| Battery gauge | Partly | Battery percentage/status reported; full charge/discharge cycle unverified |
+| Wi-Fi | Partly | Native status bar signal bars via kernel LQM events; DMA barriers, `rx_confused` recovery, and multi-AP fallback added; long-term stability under test |
+| Safari / Web | Partly | Loads and refreshes pages over Wi-Fi; extended stability and video decoding need work |
+| Bluetooth | Partly | Enabled by default via native `AppleOLYHAL` (no userspace shim); toggles, scans, pairs, and connects headphones/phones; no BT audio; pairings need `--persist` |
+| Reduced render scale (`fbscale=2`) | Partly | Optional (`fbscale=2 fb_dpu=1`); smoother UI with status bar fix and static wallpaper; some apps crash |
+| Static wallpaper | Works | User-supplied image (`/redwood/etc/wallpaper.jpg`); changing wallpaper in Settings has no effect |
+| Internal speaker audio | Partly | Enabled by default; iOS audio plays via ADSP + TAS2557 (~31 ms warmup, ~207 ms idle coeff check); uncalibrated EQ; long-term power untested |
+| Persistent `/private/var` (`--persist`) | Partly | First save/restore test verified under `--persist`; crash/periodic saving untested |
+| Cellular / Mobile data | Not tested | Not yet verified working |
+| Bluetooth audio / Mic / Calls | No | Not yet implemented |
 
-### 3. Build the boot image
+Detailed status and verification boundaries are tracked in [docs/STATUS.md](docs/STATUS.md).
 
-```bash
-export CMDLINE="<the cmdline from NOTES-FAJITA.md> adreno=9 zap=1 gpuhold=1"
-export ADT_GAMUT=P3
-bash tools/build-fajita.sh          # -> shim/out/shim-boot.img
-```
+## Source-Only Policy & Compliance
 
-`tools/build-fajita.sh` reads the kernel from `xnu/out/kernel.development.sweet`, builds the
-ADT (`tools/mkadt.py`), packs the payload (`tools/mkpayload.py`) and wraps it (`shim/build.sh`).
+This repository publishes **source patches, file manifests, host build/test tools, and documentation only**:
 
-### 4. Flash
+- **No prebuilt kernels or merged binaries** are hosted or distributed (see [GPU_LICENSE.md](docs/legal/GPU_LICENSE.md#distribution-policy) regarding `mi8_a630_hw_init.inc` and APSL 2.0/GPL-2.0-only boundaries).
+- **No Apple binaries or IPSW contents** (no rootfs, dyld shared cache, system apps, fonts, or proprietary Apple keys/certificates) are committed.
+- **No proprietary vendor firmware** is committed; device firmware (`a630_*`, `crbtfw21.tlv`/`crnv21.bin`, `tas2557_uCDSP_goer.bin`) and device-unique GPT GUIDs/MAC addresses must be obtained from your own device. Public patches keep zero/placeholder identifiers (`loader.c`).
 
-```bash
-# the iOS root (destructive: this is the userdata partition)
-fastboot flash userdata ios16-root-gpu.img
+## Building & Reproducing (Linux x86_64)
 
-# the kernel/boot image
-fastboot flash boot_a shim-boot.img
-fastboot reboot
-```
+Developed on **Ubuntu 26.04.1 LTS (`x86_64`)**. Rather than tracking a full XNU fork directly, this repository reproduces the port deterministically from pinned upstream commits ([upstream.lock.json](upstream.lock.json)), component patches (`patches/`), and file checksums ([source-manifest.json](source-manifest.json)).
 
-On Windows the fastboot from platform-tools is the one that works with this bootloader; a
-`fastboot` inside WSL is usually that same Windows binary, so pass it Windows-style paths.
+> **Note:** Chinese mirrors of all documentation are available under [docs/zh-CN/](docs/zh-CN/README.md).
 
-### 5. Read the log
+1. **Verify repo files and prepare pinned sources**:
+   ```sh
+   git clone https://github.com/youzjuzi/dipper-xnu.git
+   cd dipper-xnu
+   sha256sum -c SHA256SUMS
+   python3 -B tools/prepare/prepare.py --prepare
+   ```
+2. **Stage external inputs & extract IPSW** ([docs/build/INPUTS.md](docs/build/INPUTS.md), [docs/build/USERLAND.md](docs/build/USERLAND.md)):
+   - Verify and place `THEOS`, `iPhoneOS16.5.sdk` (`tools/prepare/check-sdk.py`), `MacOSX13.3.sdk`, `linux-7.0.14`, `freebsd-15.1-src`, `mesa-25.0.7`, and the `iOS 16.5 (20F66)` IPSW (`tools/prepare/prepare-ios.py`).
+   - Extract required device firmware from your own Xiaomi Mi 8 ([docs/install/DEVICE_PREPARATION.md](docs/install/DEVICE_PREPARATION.md)) and match your device's `darwin` partition GUID in `loader.c`.
+3. **Build kernel, loader/UEFI, userspace & host images** ([docs/build/BUILD.md](docs/build/BUILD.md)):
+   ```sh
+   # First-time kernel dependencies & ath10k inside work/hackios:
+   #   bash xnu-deps/setup.sh && bash tools/mk-ath10k.sh
+   bash tools/build/build-kernel.sh
+   bash tools/build/build-loader-uefi.sh
+   bash tools/build/build-userland.sh
+   python3 -B tools/build/pack-darwin.py
+   python3 -B tools/build/build-payload.py --output work/runs/<run-id> --wifi --link-inputs
+   ```
+4. **Verify workspace status & host test suite** ([tools/README.md](tools/README.md)):
+   ```sh
+   PYTHONDONTWRITEBYTECODE=1 python3 -B tools/prepare/status.py --deep
+   PYTHONDONTWRITEBYTECODE=1 python3 -B tools/tests/run-tests.py --suite all --clean-replay --sanitize
+   ```
 
-The panel is the first console, and the ring in `userdata` keeps the whole boot:
+**First-time device installation requires creating an independent `darwin` UFS partition, which wipes Android `userdata`.** The system image is written to UFS and booted via temporary RAM-loaded UEFI (`fastboot boot`), never flashing over stock Android boot permanently. Read [INSTALL.md](docs/install/INSTALL.md) and back up GPT/data before touching a phone.
 
-```bash
-tools/sweet-log-pull.sh            # boots OrangeFox, pulls the ring to fajita-logs/
-tools/sweet-log.py fajita-logs/<newest>.txt --grep GPU
-```
+### Tool Layout
 
-After a hard hang, a photo of the panel is authoritative — the ring can be stale if the
-panic happened during a flush.
-
-## The GPU
-
-The bring-up follows the ladder of HackiOS (`oosexgang`) and Bergamota (`ry-diffusion`), which
-runs the same SDM845/Adreno 630. Boot arguments select how far it goes: `adreno=1..9`,
-`zap=1` (the secure-world step), `gpuhold=1` (keep the GPU up after the self-tests).
-
-| Stage | What it proves |
+| Directory | Purpose |
 | --- | --- |
-| 1–2 | block probes, CX/GX power domains, GPU clocks |
-| 3 | GMU firmware (`0xbabeface` handshake), HFI v1, SMMU contexts |
-| 5 | GX rail through the GMU OOB path, SPTPRAC, the core answering (`RBBM_STATUS`) and then giving the rail back |
-| 6 | the signed **zap** through SCM/PAS id 13 (TrustZone authenticates it) |
-| 7 | command processor: `hw_init`, `CP_ME_INIT`, out of secure mode, and a NOP + `CP_MEM_WRITE` + `CACHE_FLUSH_TS` submission whose result is read back |
-| 8 | keep-alive, a 1 GiB client address space with page tables on demand, submit as "command buffer + fence", buffers, and the **IOKit user client** a userspace driver opens |
+| `tools/prepare/` | Pinned source preparation, patch export/replay/privacy scan, workspace status & cleanup, SDK/IPSW checks |
+| `tools/build/` | Incremental kernel, loader/UEFI, and userspace builds; `darwin.img` & bounded payload packaging |
+| `tools/partition/` | Offline GPT partition / Android restore plan generation and readback verification |
+| `tools/tests/` | Unified host test runner, clean-replay validation, synthetic GPT, and audio/workflow self-tests |
 
-Everything above is verified in the boot log on the device, with the GPU held up and iOS
-running normally. The per-patch history, every register number and the traps are in
-[`NOTES-FAJITA.md`](NOTES-FAJITA.md).
+## Known Issues
 
-**Next**: `tools/sweet-iokit-test.c` exercises the ABI from userspace today; after that comes
-`gpu/freedreno-sweet`-style libdrm stand-in, Mesa/freedreno, then Chlorophyll and the
-`IOAcceleratorES`/`MetalPluginName` step that lets CoreAnimation use it.
+- First cold app launch after boot has a brief loading delay (render-thread big-core affinity is not yet implemented; optional `fbscale=2` mode still causes some apps to crash).
+- Bluetooth headphones receive no audio yet, pairings are not saved across reboots without `--persist`, and Bluetooth initializes ~70 s after boot.
+- Internal speaker activates ~1 minute after boot (after Wi-Fi setup); sound quality is uncalibrated and long-term power draw is unmeasured.
+- Long-term Wi-Fi stability and extended web video playback need further testing.
+- Baseband `halt port modem` does not idle on warm stop; devices still require a full reboot between modem/baseband runs.
+- Storage configuration targets an experimental layout (`darwin` partition) and does not yet ship as a generic one-click installer.
 
-### A userland toolchain without macOS
+## Contributing
 
-There is no Xcode here and none is needed:
+Issues, source patches, and reproducible host/device reports are welcome. Please read [DEVELOPMENT.md](docs/development/DEVELOPMENT.md) and [CONTRIBUTING.md](CONTRIBUTING.md) first. Never include personal data, device-unique GUIDs/MACs/serials, device backups, Apple system images, or proprietary firmware in patches or issues.
 
-```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git ~/ios-sdk
-cd ~/ios-sdk && git sparse-checkout set iPhoneOS16.5.sdk
+## Acknowledgements
 
-clang --target=arm64-apple-ios16.0 -isysroot ~/ios-sdk/iPhoneOS16.5.sdk -fuse-ld=lld -O2 \
-      -L~/ios-sdk/iPhoneOS16.5.sdk/usr/lib -Wl,-adhoc_codesign -o tool tool.c \
-      -framework IOKit -framework CoreFoundation -lSystem
-```
+This port builds on the work of many open-source projects, especially:
 
-That produces a normal dynamic arm64 Mach-O with `LC_LOAD_DYLIB` entries, which is what the
-graphics stack needs.
+- **OOSEX GANG / HackiOS**: Core XNU port, `xnuloader`, userspace shims, and wireless compatibility layer.
+- **Apple Open Source**: XNU and related open-source packages.
+- **edk2-porting / Renegade Project, TianoCore, SimpleInit**: SDM845 UEFI and display/boot framework.
+- **UniXNU / DarwinBoot**: Early boot components and reference work.
+- **Linux, Mesa / freedreno, FreeBSD**: Hardware drivers, Adreno 630 graphics, and LinuxKPI base.
+- **[Team Win / TWRP & dipper maintainers](https://twrp.me/xiaomi/xiaomimi8.html)**: Recovery environment for partition maintenance and image verification.
+- **Theos, LLVM, and related toolchains**.
 
-## Repository layout
+See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
 
-```
-xnu/patches/            the kernel patch series (apply in order)
-shim/                   the small loader the bootloader jumps to
-tools/                  build, image, log and userspace helpers
-dtb/                    the device trees dumped from the phone
-shim/out/, xnu/out/     build products (not committed)
-NOTES-FAJITA.md         the working handoff: state, registers, traps, next steps
-PORTING.md              hardware notes and the bring-up plan
-```
+## License
 
-## Credits
+This repository is **not** licensed under a single MIT license; each component retains its original license:
 
-# **- [ios-fajita](https://github.com/edi194/ios-fajita) - Base of this fork, most of the stuff was fully derived from this, huge thanks!**
-- [ios-sweet](https://github.com/dipa-studio/ios-sweet) — the iOS 16 / XNU base this fork
-  started from; `docs/IOS16_README.md` keeps that history.
-- HackiOS (`oosexgang`) — the Adreno bring-up ladder the GPU work follows.
-- [Bergamota](https://github.com/ry-diffusion/Bergamota) and
-  [Chlorophyll](https://github.com/ry-diffusion/Chlorophyll) — the SDM845/Adreno 630 kernel
-  bring-up, the msm-compatible IOKit user client, and the AIR→NIR→ir3 Metal driver.
-- [theos/sdks](https://github.com/theos/sdks) — the iOS SDK used to build userland tools.
-- Apple's open-source releases (XNU, IOHIDFamily, libpthread, hfs), BearSSL, and OrangeFox
-  Recovery. iOS itself is Apple's and is not distributed here.
+- Original build scripts, documentation, standalone headers/configurations, and inventoried original modules: **MIT** ([LICENSES/MI8-packaging-MIT.txt](LICENSES/MI8-packaging-MIT.txt)).
+- XNU / HackiOS-derived kernel and loader modifications: **APSL 2.0** ([LICENSES/APSL-2.0.txt](LICENSES/APSL-2.0.txt)), keeping upstream notices.
+- Third-party derivatives (`edk2-sdm845`, `SimpleInit`, `UniXNU`, `FreeBSD`, `WLFW` / `ISC`, Linux-derived `mi8_a630_hw_init.inc` under `GPL-2.0-only`): see [LICENSE.md](LICENSE.md), [LICENSES/](LICENSES), [LICENSE_REVIEW.md](docs/legal/LICENSE_REVIEW.md), [GPU_LICENSE.md](docs/legal/GPU_LICENSE.md), and [license-inventory.json](license-inventory.json).
+
+This is an independent research project with no affiliation with device or OS vendors. Documentation index: [docs/README.md](docs/README.md).

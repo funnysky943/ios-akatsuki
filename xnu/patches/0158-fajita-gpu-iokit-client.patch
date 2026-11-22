@@ -756,7 +756,7 @@
 +	if (r->nr_bos == 0 || r->nr_bos > SUBMIT_BOS_MAX || r->nr_cmds == 0 || r->nr_cmds > SUBMIT_CMDS_MAX) {
 +		return kIOReturnBadArgument;
 +	}
-+	if ((r->flags & ~SWEET_MSM_SUBMIT_NO_IMPLICIT) != 0 || r->nr_in_syncobjs != 0 || r->nr_out_syncobjs != 0 ||
++	if ((r->flags & ~(uint32_t)(SWEET_MSM_SUBMIT_NO_IMPLICIT | SWEET_MSM_PIPE_3D0)) != 0 || r->nr_in_syncobjs != 0 || r->nr_out_syncobjs != 0 ||
 +	    r->in_syncobjs != 0 || r->out_syncobjs != 0 || (r->queueid >= QUEUE_IDS) ||
 +	    (r->queueid != 0 && !(fQueues & (1ull << r->queueid)))) {
 +		return kIOReturnUnsupported;

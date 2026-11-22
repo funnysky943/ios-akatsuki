@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs the ported Mesa/freedreno probe once at boot, as an ordinary daemon.
+
+  It must not run from /sbin/launchd: the init task has no GPU user-client rights on this
+  kernel, and opening SweetAdreno630 there panics. logd/backboardd-style daemons are fine.
+
+  Output goes to /dev/console (the persistent kernel log), and the rendered picture is left
+  in /tmp/gl_test.ppm for the host to pull.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.redwood.gltest</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/gl_test</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+	<key>KeepAlive</key>
+	<false/>
+	<key>ThrottleInterval</key>
+	<integer>0</integer>
+</dict>
+</plist>

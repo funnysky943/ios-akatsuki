@@ -1,0 +1,88 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,3 +41,5 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
++void sweet_publish_scaler_stub(class IOService *parent);
++
+ #if defined(SWEET)
+@@ -255,3 +257,4 @@
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	sweet_publish_scaler_stub(this);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+@@ -706,3 +709,74 @@
+ 	return ret;
+ }
++namespace {
++class SweetScalerStubClient : public IOUserClient {
++    OSDeclareDefaultStructors(SweetScalerStubClient)
++public:
++    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++        IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override {
++        if (selector == 1 && args->structureInput != NULL &&
++            args->structureInputSize >= 32) {
++            const uint32_t *p = (const uint32_t *)args->structureInput;
++            uint32_t srcID = p[0];
++            uint32_t dstID = p[1];
++            uint32_t op = p[3];
++            SweetSurface *src = sweet_surface_copy(srcID);
++            SweetSurface *dst = sweet_surface_copy(dstID);
++            if (src != NULL && dst != NULL && op == 1 &&
++                src->bytesPerRow == dst->bytesPerRow &&
++                src->height == dst->height) {
++                uint8_t *s = (uint8_t *)src->kernelAddress();
++                uint8_t *d = (uint8_t *)dst->kernelAddress();
++                uint32_t stride = src->bytesPerRow;
++                uint32_t bytes = src->width * 4;
++                if (s != NULL && d != NULL && stride >= bytes) {
++                    for (uint32_t y = 0; y < src->height; y++) {
++                        memcpy(d + y * stride, s + y * stride, bytes);
++                    }
++                }
++            }
++            OSSafeReleaseNULL(src);
++            OSSafeReleaseNULL(dst);
++        }
++        return kIOReturnSuccess;
++    }
++};
++OSDefineMetaClassAndStructors(SweetScalerStubClient, IOUserClient)
++
++class AppleM2ScalerCSCDriver : public IOService {
++    OSDeclareDefaultStructors(AppleM2ScalerCSCDriver)
++public:
++    virtual bool start(IOService *provider) override {
++        if (!IOService::start(provider)) return false;
++        registerService();
++        return true;
++    }
++    virtual IOReturn newUserClient(task_t owningTask, void *securityID,
++        UInt32 type, OSDictionary *properties,
++        LIBKERN_RETURNS_RETAINED IOUserClient **handler) override {
++        SweetScalerStubClient *c = OSTypeAlloc(SweetScalerStubClient);
++        if (c == nullptr) return kIOReturnNoMemory;
++        if (!c->initWithTask(owningTask, securityID, type) ||
++            !c->attach(this) || !c->start(this)) {
++            c->release();
++            return kIOReturnError;
++        }
++        *handler = c;
++        return kIOReturnSuccess;
++    }
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService)
++}
++
++void sweet_publish_scaler_stub(class IOService *parent)
++{
++    AppleM2ScalerCSCDriver *stub = OSTypeAlloc(AppleM2ScalerCSCDriver);
++    if (stub == nullptr) return;
++    if (!stub->init() || !stub->attach(parent) || !stub->start(parent)) {
++        stub->release();
++        return;
++    }
++    stub->setName("AppleM2ScalerCSCDriver");
++    IOLog("SWEET FB: scaler stub published as AppleM2ScalerCSCDriver\n");
++}
+ #endif /* SWEET */

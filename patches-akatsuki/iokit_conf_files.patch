@@ -1,0 +1,31 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -25,6 +25,8 @@
+ #include <miscfs/devfs/devfs.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* iokit/Kernel/arm/SweetAdreno.cpp: the service a client opens */
++extern void SweetAdrenoPublish(void);
+ void sweet_gpu_probe(void);
+ 
+ #define GPU_PA          0x05000000u
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3227,6 +3227,7 @@
+ 									    gpu_cp_wptr);
+ 									(void)gpu_abi_test();
+ 									gpu_dev_register();
++									SweetAdrenoPublish();
+ 								} else {
+ 									gpu_zap_shutdown();
+ 								}

@@ -1,0 +1,3475 @@
+diff --git a/tools/mesa/redwood-drm/redwood_drm.c b/tools/mesa/redwood-drm/redwood_drm.c
+index 6a09c896a06ae85c70b329b320380eea10fc9b6d..3f7d80bf41772ae3b2b63b42d4b9937f51eb16f7 100644
+--- a/tools/mesa/redwood-drm/redwood_drm.c
++++ b/tools/mesa/redwood-drm/redwood_drm.c
+@@ -13,6 +13,7 @@
+ #include <unistd.h>
+ 
+ #include <IOKit/IOKitLib.h>
++#include <mach/mach_time.h>
+ 
+ #include "xf86drm.h"
+ 
+@@ -23,6 +24,16 @@
+ static io_connect_t connection;
+ static int connection_fd = -1;
+ 
++/*
++ * How often each request was made and how long the kernel took (mach ticks), by selector: the OpenGL ES
++ * library (src/eagl.c, userland) reads them to say which GL calls caused GPU submissions (selector 0x46 =
++ * DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, EXP-0174). Visible outside this library on purpose.
++ */
++__attribute__((visibility("default"))) unsigned long redwood_drm_calls[256];
++__attribute__((visibility("default"))) unsigned long redwood_drm_ticks[256];
++/* ... and all requests together: [0] how many, [1] ticks (EXP-0175: which GL calls spend time in the kernel, whatever the request) */
++__attribute__((visibility("default"))) unsigned long redwood_drm_total[2];
++
+ int
+ drmOpenWithType(const char *name, const char *busid, int type)
+ {
+@@ -53,8 +64,14 @@ static int
+ call(unsigned number, void *data, size_t size)
+ {
+ 	size_t returned = size;
++	uint64_t began = mach_absolute_time();
+ 	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
+ 
++	redwood_drm_calls[number & 0xff]++;
++	redwood_drm_ticks[number & 0xff] += mach_absolute_time() - began;
++	redwood_drm_total[0]++;
++	redwood_drm_total[1] += mach_absolute_time() - began;
++
+ 	switch (result) {
+ 	case 0:
+ 		return 0;
+@@ -99,6 +116,16 @@ int
+ drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
+ {
+ 	(void)fd;
++	/*
++	 * DRM_MSM_GEM_MADVISE (freedreno's buffer cache asks about every buffer it reuses): the kernel's answer
++	 * is always "retained" and it does nothing else (RedwoodGPU.cpp, kMsmGemMadvise), and a request costs
++	 * a round trip of ~13 us, ~37 a frame (EXP-0175). Answered here; the count is kept.
++	 */
++	if (index == 0x08 && size >= 12) {
++		((uint32_t *)data)[2] = 1;
++		redwood_drm_calls[DRM_COMMAND_BASE + index]++;
++		return 0;
++	}
+ 	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
+ }
+ 
+diff --git a/tools/mk-mesa.sh b/tools/mk-mesa.sh
+index 4f0aa3944cc2b3fd647e6693f6fb605455e01333..027a28f9e83bcd08baf302f0d292d8585da981e3 100755
+--- a/tools/mk-mesa.sh
++++ b/tools/mk-mesa.sh
+@@ -76,7 +76,11 @@ rm -rf mesa-$VERSION/src/compiler/air
+ cp -r "$ROOT/tools/mesa/air" mesa-$VERSION/src/compiler/air
+ if [ ! -x venv/bin/python3 ]; then
+ 	python3 -m venv venv
+-	venv/bin/pip -q install mako pyyaml packaging
++fi
++# A failed download can leave a valid venv without its dependencies. Retry the
++# dependency step instead of treating the directory's existence as success.
++if ! venv/bin/python3 -c 'import mako, yaml, packaging' >/dev/null 2>&1; then
++	venv/bin/pip --isolated --disable-pip-version-check install --no-cache-dir mako pyyaml packaging
+ fi
+ export PATH=$B/venv/bin:$PATH
+ 
+@@ -110,12 +114,12 @@ BUILD=build-${DRIVERS//,/-}
+ 	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
+ 	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
+ 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
+-ninja -C $BUILD > ninja.log
++ninja -j "${BUILD_JOBS:-8}" -C $BUILD > ninja.log
+ # air_run draws with a translated Metal shader and reads the pixels back; it is
+ # the only way to find out whether the Adreno takes work that did not come from
+ # the window server. Built only when asked, since it is a test program.
+ if [ "${AIR:-}" = 1 ]; then
+-	ninja -C $BUILD src/gallium/drivers/freedreno/air_run >> ninja.log
++	ninja -j "${BUILD_JOBS:-8}" -C $BUILD src/gallium/drivers/freedreno/air_run >> ninja.log
+ 	cp $BUILD/src/gallium/drivers/freedreno/air_run out/air_run
+ 	echo "mk-mesa.sh: $B/out/air_run ($(stat -c %s out/air_run) bytes)"
+ 	# and the same path as a library, which is not a test program: the Metal driver links
+@@ -123,7 +127,7 @@ if [ "${AIR:-}" = 1 ]; then
+ 	# libOSMesa is below -- -x keeps the global symbols, which here are the rwa_* of
+ 	# tools/mesa/air/air_metal.h, and the install name has to be the path on the device
+ 	# because meson's own is @rpath.
+-	ninja -C $BUILD src/gallium/drivers/freedreno/libredwoodair.dylib >> ninja.log
++	ninja -j "${BUILD_JOBS:-8}" -C $BUILD src/gallium/drivers/freedreno/libredwoodair.dylib >> ninja.log
+ 	llvm-strip -x -o out/libredwoodair.dylib $BUILD/src/gallium/drivers/freedreno/libredwoodair.dylib
+ 	install_name_tool -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
+ 	echo "mk-mesa.sh: $B/out/libredwoodair.dylib ($(stat -c %s out/libredwoodair.dylib) bytes," \
+diff --git a/userland/build.sh b/userland/build.sh
+index 582866f82497f32c86226f6a095e0a8e0c9dc791..8da08222e337f2e9274af2774fa221614d22f212 100755
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -17,6 +17,10 @@
+ #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
+ #                                   src/inject_media.c in mediaserverd);
+ #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
++#                      BT=1         with iOS's Bluetooth: the jobs bluetoothd and BlueTool, src/inject_bt.c inside
++#                                   both, and the placeholder of the controller's firmware in etc/bluetool. For a
++#                                   kernel booted with bt=7, which makes the services they talk to (bsd/dev/mi8_bt.c,
++#                                   iokit/Kernel/RedwoodBT.cpp); the WCN3990's own firmware comes from ../fw-bt
+ #                      STOREFRONT=1 ... and src/inject_store.c inside appstored: the storefront answered,
+ #                                   and a bag request watched for (an experiment; see that file)
+ #                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
+@@ -60,6 +64,7 @@
+ #                    `xl ramdisk userland/system.apfs`. Rebuilt when missing, when its inputs
+ #                    (stage0, the manifest, the cryptex files) are newer, or with SYSTEM=1 (after
+ #                    changing the recipe below).
++#                    SKIP_SYSTEM=1 omits this separate RAM-root image for the UFS boot recipe.
+ #   flashboot.apfs   FLASHBOOT=1: the RAM part of a boot whose root is the iOS volume on the phone's
+ #                    flash (see below); with CRYPTEXES=flash the boot volume alone, the cryptexes being
+ #                    on the flash. FLASHBOOT=1 also decides what goes into root.apfs: the job list is
+@@ -68,13 +73,15 @@
+ #                    That root.apfs is for a flash boot; a RAM boot wants one built without FLASHBOOT=1,
+ #                    or launchd will fail to start those few when something asks for them.
+ #
+-#   PREBUILT=1       do not compile anything: take our programs from ../prebuilt/userland (this is also
+-#                    what happens when the cross toolchain is not set up, see ../xnu-deps/setup.sh);
++#   PREBUILT=1       explicitly take programs from ../prebuilt/userland; an absent cross toolchain
++#                    otherwise fails instead of silently substituting prebuilt programs;
+ #                    the images are then made of them and of the iOS files alone (python3)
+ #   CHECK=1          check every image (every container) as it is made: apfsck has to find it clean and
+ #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
+ #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
+-set -e
++set -e -o pipefail
++# launchd rejects group-writable service files and parent directories.
++umask 022
+ cd "$(dirname "$(readlink -f "$0")")"
+ source ../xnu-env.sh
+ 
+@@ -103,7 +110,7 @@ IOS_JOBS=${JOBS-"
+ 	com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc com.apple.lsd
+ 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
+ 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
+-	com.apple.SpringBoard
++	com.apple.SpringBoard com.apple.mobile.installd com.apple.sleepd
+ "}
+ # iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
+ # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
+@@ -116,6 +123,9 @@ IOS_JOBS=${JOBS-"
+ # (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
+ # WIFID=0 leaves it out.
+ [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
++# BT=1: iOS's Bluetooth daemon and the program that boots the controller for it (mkjobs.py gives bluetoothd its
++# transport, the kernel's AppleBTHci).
++[ -n "$BT" ] && IOS_JOBS="$IOS_JOBS com.apple.bluetoothd com.apple.BlueTool"
+ # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
+ # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
+ # libredwood-media.dylib).
+@@ -140,7 +150,10 @@ INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd cont
+ /redwood/lib/libredwood-fairplay.dylib fairplayd.H2"
+ mkdir -p obj
+ 
+-if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
++if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then
++	echo "build.sh: ld64 is missing; set THEOS and run xnu-deps/setup.sh before building from source" >&2
++	exit 1
++fi
+ if [ -n "$PREBUILT" ]; then
+ 	echo "build.sh: not compiling, using the programs in prebuilt/userland"
+ 	for f in ../prebuilt/userland/*; do
+@@ -270,7 +283,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
+ 		$DYN -o obj/vol_ls src/vol_ls.c
+ 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
+ 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
+-		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
++		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -framework Network -o obj/net_test src/net_test.m
+ 		# (the account database answers only a client with the entitlements its own daemons hold: src/store_test.m)
+ 		$DYN -fobjc-arc -framework Foundation -framework Accounts -o obj/store_test src/store_test.m &&
+ 			{ ${LDID:-ldid} -Ssrc/store_test.entitlements obj/store_test 2>/dev/null ||
+@@ -296,6 +309,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
+ 		# program either as the one library the kernel inserts or opened by a library of ours
+ 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-tweaks.dylib -framework CoreFoundation -lobjc \
+ 			-o obj/libredwood-tweaks.dylib src/inject_tweaks.c
++		# ... inside BlueTool and bluetoothd (BT=1): the Wi-Fi/Bluetooth module's maker answered (src/inject_bt.c)
++		$DYN -dynamiclib -install_name /redwood/lib/libredwood-bt.dylib -framework CoreFoundation -lMobileGestalt \
++			-o obj/libredwood-bt.dylib src/inject_bt.c
+ 		# ... and inside an application, to say what killed it (src/inject_app.c)
+ 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
+ 			-o obj/libredwood-app.dylib src/inject_app.c
+@@ -362,7 +378,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
+ 		fi
+ 	fi
+ 	# (drawable_test is built in the same block as surf_test, so it is copied with it)
+-	cp obj/hello_dyn obj/svc_test obj/surf_test obj/drawable_test obj/rwtouch obj/mg_test root/bin/
++	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
++	[ -f obj/drawable_test ] && cp obj/drawable_test root/bin/     # (prebuilt/userland is from before this program)
+ 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
+ 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
+ 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
+@@ -449,6 +466,14 @@ if [ -d $IOS/rootfs/usr/lib ]; then
+ 	[ -f obj/libredwood-fairplay.dylib ] && cp obj/libredwood-fairplay.dylib root/lib/
+ 	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
+ 	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
++	if [ -n "$BT" ]; then
++		# BlueTool sends the controller the firmware file of its chip's name from /etc/bluetool (init binds this
++		# directory there). The Broadcom file of the iPhone means nothing to the Qualcomm chip, and the kernel
++		# answers BlueTool's vendor commands itself: one Launch RAM command (0xfc4e, address 0xffffffff) is
++		# enough for BlueTool to find a file and finish its script.
++		mkdir -p root/etc/bluetool
++		printf '\x4e\xfc\x04\xff\xff\xff\xff' > root/etc/bluetool/BCM4357B1_placeholder.hcd
++	fi
+ 	[ -f obj/libredwoodmetal.dylib ] && cp obj/libredwoodmetal.dylib root/lib/
+ 	[ -f obj/libredwoodair.dylib ] && cp obj/libredwoodair.dylib root/lib/
+ 	if [ -f obj/RedwoodAudio ]; then
+@@ -491,7 +516,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
+ 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
+ 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
+ 	# points back into /var); point them at the data that ships with the system, and use this machine's zone
+-	zone=$(timedatectl show -p Timezone --value 2>/dev/null); zone=${zone:-UTC}
++	zone=${BUILD_TIMEZONE:-}
++	if [ -z "$zone" ]; then zone=$(timedatectl show -p Timezone --value 2>/dev/null || true); fi
++	zone=${zone:-UTC}
+ 	sed -i -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
+ 		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel
+ 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
+@@ -548,6 +575,12 @@ if [ -d ../fw-gpu ]; then
+ 	mkdir -p root/fw
+ 	cp ../fw-gpu/* root/fw/
+ fi
++# Mi8 ath10k feature metadata from linux-firmware (not the modem DSP image).
++if [ -f ../fw-wifi/firmware-5.bin ]; then
++	printf '%s  %s\n' fef6539e0127579536bc977be57a90d018b83f2931fedc3a8870fbe38d6c4127 ../fw-wifi/firmware-5.bin | sha256sum -c -
++	mkdir -p root/fw
++	install -m 0644 ../fw-wifi/firmware-5.bin root/fw/
++fi
+ # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
+ # (bsd/dev/redwood_wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
+ # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
+@@ -675,6 +708,18 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
+ 		mkdir -p flashboot/fw
+ 		cp ../fw-audio/aw882xx_acf.bin flashboot/fw/
+ 	fi
++	# Private TAS2557 tuning image; consumed only by the gated shutdown probe.
++	if [ -f ../fw-audio/tas2557_uCDSP_goer.bin ]; then
++		mkdir -p flashboot/fw
++		cp ../fw-audio/tas2557_uCDSP_goer.bin flashboot/fw/
++	fi
++
++	# the Bluetooth chip's firmware, the phone's /bt_firmware/image (the "bluetooth" partition): the rampatch and the NVM of
++	# the WCN3990, pulled from the phone into ../fw-bt (never in the repository); the kernel's bt=5 step finds them in fw/
++	if [ -f ../fw-bt/crbtfw21.tlv ] && [ -f ../fw-bt/crnv21.bin ]; then
++		mkdir -p flashboot/fw
++		cp ../fw-bt/crbtfw21.tlv ../fw-bt/crnv21.bin flashboot/fw/
++	fi
+ 	# the package manager's prefix, when tools/mk-jb.sh has fetched one: /jb of the boot volume, which is
+ 	# /private/preboot/jb once the iOS volume is the root -- the volume where a rootless jailbreak keeps its
+ 	# Procursus on an iPhone as well; init grafts it onto /var/jb (src/init.c, mount_writable)
+@@ -688,6 +733,19 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
+ 		done
+ 		echo "  the package manager's prefix: $(du -sh flashboot/jb | cut -f1) as /jb of the boot volume"
+ 	fi
++	# Applications from outside this tree: every .app in ../apps goes into /apps of the boot volume, which init lays
++	# over the iOS volume's /Applications as a union (src/init.c, flash_root). The iOS volume is Apple's and is
++	# not written to. The boot volume is the resident RAM disk (fastboot oem ramdisk; up to the loader's memory
++	# window, not the payload's 64 MB), so what goes here costs RAM at every boot, hundreds of MB for a large one.
++	# cp -aL for the reason given at the system image below (a bundle of links is refused).
++	if [ "${APPS-1}" != 0 ] && [ -n "$SKIP_SYSTEM" ]; then
++		for app in ../apps/*.app; do
++			[ -d "$app" ] || continue
++			mkdir -p flashboot/apps
++			cp -aL "$app" flashboot/apps/
++			echo "  ${app##*/} in the boot volume's /apps ($(du -sm "$app" | cut -f1) MB from ../apps)"
++		done
++	fi
+ 	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot | tail -1
+ 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.boot.apfs Boot=flashboot
+ 	# the third container: Apple's App cryptex as it is (10 MB; fetch.sh), for the boot volume's Cryptexes/App
+@@ -708,7 +766,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
+ fi
+ 
+ # --- the system image -----------------------------------------------------------------------------
+-if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
++if [ -z "$SKIP_SYSTEM" ] && [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
+ 	{ [ ! -f system.apfs ] || [ obj/stage0 -nt system.apfs ] || [ $IOS/system.manifest -nt system.apfs ] ||
+ 	  [ $IOS/cryptex -nt system.apfs ] || [ $IOS/cryptex-app -nt system.apfs ] || [ -n "$SYSTEM" ]; }; then
+ 	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
+diff --git a/userland/mkjobs.py b/userland/mkjobs.py
+index a92a4efa73630c2c13570ec98fd09f07462bbad3..c4149dc3d1cd9a3fcf39c14133617dae79381be3 100755
+--- a/userland/mkjobs.py
++++ b/userland/mkjobs.py
+@@ -222,8 +222,15 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
+         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
+         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
+         # waits for; it now runs through a session.)
+-        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
++        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
++        # Mi 8 (MI8-IOS EXP-0235): here mobileactivationd dies with SIGTRAP every time it starts, and apsd's main thread
++        # waits for ever in -[MadGate copyLegacyDeviceIdentity:] for its answer; every client of apsd (identityservicesd,
++        # the account stack, Safari's history queue) then waits on apsd and Safari hangs on its first page. Not being
++        # there, the lookup fails at once and apsd goes on.
++        'mobileactivationd')
+ 
++# DENY_MORE="word ..." stops more of them, for trying one out (Mi 8, EXP-0147: fairplayd, which exits as it starts and is asked for again every ten seconds)
++DENY = DENY + tuple(os.environ.get('DENY_MORE', '').split())
+ # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
+ DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
+ 
+@@ -237,6 +244,10 @@ if '--root-volume' in args:
+ args = [a for a in args if a != '--rest']
+ src_root, dest, labels = args[0], args[1], args[2:]
+ oslog = os.environ.get('OSLOG', '').split()
++# Variables a job is given whoever builds it. bluetoothd's transport to the controller is otherwise a serial
++# port over Skywalk (H4BC), which this kernel has not got; APPLEBT is the IOKit service AppleBTHci, which the
++# kernel makes when booted with bt=7 (iokit/Kernel/RedwoodBT.cpp). Without bt=7 it finds no Bluetooth either way.
++JOB_ENV = {'com.apple.bluetoothd': {'BT_HCI_TRANSPORT': 'APPLEBT'}}
+ src = f'{src_root}/System/Library/LaunchDaemons'
+ # A program in a cryptex -- on a device a volume of its own, grafted at /System/Cryptexes/NAME (eight of
+ # Safari's daemons are in the App cryptex) -- is looked for where fetch.sh unpacked that cryptex, beside
+@@ -287,6 +298,15 @@ for label in labels:
+     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
+     # device tree, which the loader's tree does not have yet
+     job.pop('_LimitLoadToDeviceTree', None)
++    if label == 'com.apple.wifid':
++        # wifid checks in com.apple.wifi.manager at runtime (bootstrap_check_in) without listing it in its stock
++        # plist. Because SpringBoard spawns alongside wifid here, SBWiFiManager's one-shot lookup otherwise races
++        # wifid's startup and permanently caches a disconnected WiFiManagerClient (serverPort == 0), leaving the
++        # status bar Wi-Fi icon at 0 active bars. Pre-declaring the Mach service lets launchd create and queue the
++        # port upfront, and ResetAtClose delivers MACH_NOTIFY_DEAD_NAME if wifid ever restarts.
++        job.setdefault('MachServices', {})['com.apple.wifi.manager'] = {'ResetAtClose': True}
++    if label in JOB_ENV:
++        job.setdefault('EnvironmentVariables', {}).update(JOB_ENV[label])
+     if 'all' in oslog or label in oslog:
+         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
+     with open(f'{dest}/{label}.plist', 'wb') as f:
+@@ -322,9 +342,12 @@ if rest:
+         # it. The boot of 22 October showed what declining costs: SpringBoard's icons stopped being
+         # drawn, because its layers ask for one of those formats and a refused texture is a layer
+         # that never appears.
+-        for name in ('RWA_PACKED16',):
+-            if os.environ.get(name):
+-                job.setdefault('EnvironmentVariables', {})[name] = os.environ[name]
++        # (not `name': that is the plist's file name, written below -- reusing it sent all 387 jobs into one file)
++        for variable in ('RWA_PACKED16',):
++            if os.environ.get(variable):
++                job.setdefault('EnvironmentVariables', {})[variable] = os.environ[variable]
++        if label in JOB_ENV:
++            job.setdefault('EnvironmentVariables', {}).update(JOB_ENV[label])
+         if label in oslog:
+             job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
+         with open(f'{dest}/{name}', 'wb') as f:
+diff --git a/userland/src/eagl.c b/userland/src/eagl.c
+index 5f76b63a1ffda40ec50736edf66555c788e7b368..272f75644ae9c7516ccd9c00f509c4859a230ad1 100644
+--- a/userland/src/eagl.c
++++ b/userland/src/eagl.c
+@@ -59,9 +59,14 @@
+  * every frame (see frame_end()).
+  */
+ #include <CoreFoundation/CoreFoundation.h>
++#include <dlfcn.h>
+ #include <IOKit/IOKitLib.h>
+ #include <IOSurface/IOSurfaceRef.h>
+ #include <mach/mach_time.h>
++#include <mach/mach.h>
++#include <mach/arm/thread_status.h>
++#include <pthread.h>
++#include <sys/syscall.h>
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #include <stdarg.h>
+@@ -110,6 +115,8 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
+ #define GL_VERSION                      0x1f02
+ #define GL_EXTENSIONS                   0x1f03
+ #define GL_TEXTURE_BINDING_2D           0x8069
++#define GL_PIXEL_UNPACK_BUFFER          0x88ec
++#define GL_PIXEL_UNPACK_BUFFER_BINDING  0x88ef
+ #define GL_BGRA                         0x80e1
+ #define GL_INFO_LOG_LENGTH              0x8b84
+ #define GL_COMPILE_STATUS               0x8b81
+@@ -207,6 +214,349 @@ now_us(void)
+ 	return mach_absolute_time() * base.numer / base.denom / 1000;
+ }
+ 
++/* Optional frame measurements. No profiling syscalls when the interval is zero. */
++#define FPROF_SAMPLES 4000
++#define FPROF_DEPTH 9
++static unsigned fprof_interval;
++static unsigned ffix = 1;
++#define STILL_LOOKS 60u
++#define STILL_EVERY 4u
++/* The typed libSystem stub preserves x0; generic syscall() returns an int. */
++extern uint64_t __thread_selfusage(void);
++
++static unsigned
++ffix_parse(const char *arguments)
++{
++	const char *p = arguments;
++	while (*p) {
++		while (*p == ' ' || *p == '\t') p++;
++		const char *end = p;
++		while (*end && *end != ' ' && *end != '\t') end++;
++		if (end - p >= 5 && memcmp(p, "ffix=", 5) == 0)
++			return end - p == 6 && p[5] >= '0' && p[5] <= '9' ? (unsigned)(p[5] - '0') : 0;
++		p = end;
++	}
++	return 1;
++}
++static unsigned fprof_started;
++static uint64_t fprof_run_total, fprof_wait_total;
++static thread_t fprof_target;
++static pthread_t fprof_pthread;
++static uintptr_t fprof_stack_low, fprof_stack_high;
++static mach_timebase_info_data_t fprof_timebase;
++struct fprof_sample { uintptr_t pc[FPROF_DEPTH]; unsigned depth; };
++static struct fprof_sample fprof_samples[FPROF_SAMPLES];
++
++static unsigned
++fprof_parse(const char *arguments)
++{
++	const char *p = arguments;
++	while (*p) {
++		while (*p == ' ' || *p == '\t') p++;
++		const char *end = p;
++		while (*end && *end != ' ' && *end != '\t') end++;
++		if (end - p >= 6 && memcmp(p, "fprof=", 6) == 0) {
++			unsigned value = 0;
++			bool valid = end != p + 6;
++			for (const char *q = p + 6; q < end; q++) {
++				if (*q < '0' || *q > '9' || value > 10000) { valid = false; break; }
++				value = value * 10 + (unsigned)(*q - '0');
++			}
++			if (valid && value == 0) return 0;
++			if (valid && value >= 200 && value <= 10000) return value;
++			say("tl: prof disabled invalid_interval\n");
++			return 0;
++		}
++		p = end;
++	}
++	return 0;
++}
++
++static int
++fprof_cpu(void)
++{
++	uint64_t value;
++	__asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(value));
++	return (int)(value & 0xfff);
++}
++
++static int64_t
++fprof_cpu_us(void)
++{
++	/* syscalls.master 482 -> uint64_t thread_get_runtime_self(), live slice included. */
++	uint64_t ticks = __thread_selfusage();
++	if (ticks == UINT64_MAX || !fprof_timebase.denom) return -1;
++	return (int64_t)(((__uint128_t)ticks * fprof_timebase.numer) / fprof_timebase.denom / 1000);
++}
++
++static int
++fprof_sample_compare(const void *va, const void *vb)
++{
++	const struct fprof_sample *a = va, *b = vb;
++	if (a->depth != b->depth) return a->depth < b->depth ? -1 : 1;
++	for (unsigned i = 0; i < a->depth; i++) {
++		if (a->pc[i] != b->pc[i]) return a->pc[i] < b->pc[i] ? -1 : 1;
++	}
++	return 0;
++}
++
++struct fprof_range { const char *image; uint64_t first, end; unsigned category; };
++/* FPROF_RANGES_BEGIN */
++static volatile struct fprof_range fprof_ranges[] = {
++	{ "libredwood-gl.dylib", 0x0000000000028788, 0x0000000000028ac8, 1 },
++	{ "libOSMesa.8.dylib", 0x0000000000748b2c, 0x0000000000748b5c, 3 },
++	{ "libOSMesa.8.dylib", 0x0000000000748b5c, 0x0000000000748dd0, 3 },
++	{ "libOSMesa.8.dylib", 0x0000000000748dd0, 0x0000000000748ddc, 3 },
++	{ "libOSMesa.8.dylib", 0x0000000000750624, 0x0000000000750678, 2 },
++	{ "libredwoodair.dylib", 0x000000000031745c, 0x000000000031748c, 3 },
++	{ "libredwoodair.dylib", 0x000000000031748c, 0x0000000000317700, 3 },
++	{ "libredwoodair.dylib", 0x0000000000317700, 0x000000000031770c, 3 },
++	{ "libredwoodair.dylib", 0x000000000031ef54, 0x000000000031efa8, 2 },
++};
++/* FPROF_RANGES_END */
++static const char *fprof_categories[] = { "iosurface_request", "surface_changed", "mesa_ioctl", "dmabuf_import", "iomobilefb", "other" };
++
++static const char *
++fprof_location(uintptr_t pc, uintptr_t *offset)
++{
++	Dl_info info;
++	*offset = pc;
++	if (dladdr((void *)pc, &info) && info.dli_fbase && info.dli_fname) {
++		const char *slash = strrchr(info.dli_fname, '/');
++		*offset -= (uintptr_t)info.dli_fbase;
++		return slash ? slash + 1 : info.dli_fname;
++	}
++	return "unknown";
++}
++
++static unsigned
++fprof_category(const struct fprof_sample *s)
++{
++	bool hit[5] = {0}, iosurface = false, iokit = false;
++	for (unsigned j = 0; j < s->depth; j++) {
++		/* LR/FP entries are return addresses; classify their calling instruction. */
++		uintptr_t offset;
++		const char *image = fprof_location(s->pc[j] - (j && s->pc[j] >= 4 ? 4 : 0), &offset);
++		iosurface |= strcmp(image, "IOSurface") == 0;
++		iokit |= strcmp(image, "IOKit") == 0;
++		hit[4] |= strstr(image, "IOMobileFramebuffer") != NULL;
++		for (unsigned k = 0; k < sizeof(fprof_ranges) / sizeof(fprof_ranges[0]); k++) {
++			if (!strcmp(image, fprof_ranges[k].image) && offset >= fprof_ranges[k].first && offset < fprof_ranges[k].end)
++				hit[fprof_ranges[k].category] = true;
++		}
++	}
++	hit[0] = iosurface && iokit;
++	for (unsigned i = 0; i < 5; i++) if (hit[i]) return i;
++	return 5;
++}
++
++static int
++fprof_leaf_compare(const void *va, const void *vb)
++{
++	uintptr_t a = *(const uintptr_t *)va, b = *(const uintptr_t *)vb;
++	return a < b ? -1 : a != b;
++}
++
++static void
++fprof_aggregate(unsigned count, unsigned batch, unsigned stacks)
++{
++	static uintptr_t leaves[FPROF_SAMPLES];
++	static struct { const char *name; unsigned n; } images[FPROF_SAMPLES];
++	unsigned categories[6] = {0}, image_count = 0, top_at[40] = {0}, top_n[40] = {0};
++	for (unsigned i = 0; i < count; i++) {
++		leaves[i] = fprof_samples[i].pc[0];
++		categories[fprof_category(&fprof_samples[i])]++;
++		uintptr_t off;
++		const char *name = fprof_location(leaves[i], &off);
++		unsigned k;
++		for (k = 0; k < image_count && strcmp(images[k].name, name); k++) {}
++		if (k == image_count) { images[k].name = name; images[k].n = 0; image_count++; }
++		images[k].n++;
++	}
++	qsort(leaves, count, sizeof(*leaves), fprof_leaf_compare);
++	for (unsigned at = 0; at < count;) {
++		unsigned end = at + 1;
++		while (end < count && leaves[end] == leaves[at]) end++;
++		for (unsigned i = 0; i < 40; i++) if (end - at > top_n[i]) {
++			for (unsigned j = 39; j > i; j--) { top_at[j] = top_at[j-1]; top_n[j] = top_n[j-1]; }
++			top_at[i] = at; top_n[i] = end - at; break;
++		}
++		at = end;
++	}
++	unsigned leaf_hits = 0;
++	for (unsigned i = 0; i < 40 && top_n[i]; i++) {
++		uintptr_t offset; const char *name = fprof_location(leaves[top_at[i]], &offset);
++		unsigned pct = top_n[i] * 10000 / count; leaf_hits += top_n[i];
++		say("tl: prof leaf %u.%02u%% %s+0x%llx batch=%u hits=%u samples=%u\n", pct/100, pct%100,
++		    name, (unsigned long long)offset, batch, top_n[i], count);
++	}
++	for (unsigned i = 0; i < image_count; i++) {
++		unsigned pct = images[i].n * 10000 / count;
++		say("tl: prof image %s %u.%02u%% batch=%u hits=%u samples=%u\n", images[i].name, pct/100, pct%100, batch, images[i].n, count);
++	}
++	for (unsigned i = 0; i < 6; i++) {
++		unsigned pct = categories[i] * 10000 / count;
++		say("tl: prof category %s %u.%02u%% batch=%u hits=%u samples=%u\n", fprof_categories[i], pct/100, pct%100, batch, categories[i], count);
++	}
++	unsigned stack_pct = stacks * 10000 / count, leaf_pct = leaf_hits * 10000 / count;
++	say("tl: prof coverage batch=%u samples=%u stack_hits=%u leaf_hits=%u image_hits=%u category_hits=%u stack_pct=%u.%02u leaf_pct=%u.%02u image_pct=100 category_pct=100\n",
++	    batch, count, stacks, leaf_hits, count, count, stack_pct/100, stack_pct%100, leaf_pct/100, leaf_pct%100);
++}
++
++static void
++fprof_report(unsigned count)
++{
++	unsigned top_at[30] = {0}, top_n[30] = {0};
++	qsort(fprof_samples, count, sizeof(fprof_samples[0]), fprof_sample_compare);
++	for (unsigned at = 0; at < count;) {
++		unsigned end = at + 1;
++		while (end < count && fprof_sample_compare(&fprof_samples[at], &fprof_samples[end]) == 0) end++;
++		for (unsigned i = 0; i < 30; i++) {
++			if (end - at > top_n[i]) {
++				for (unsigned j = 29; j > i; j--) { top_at[j] = top_at[j-1]; top_n[j] = top_n[j-1]; }
++				top_at[i] = at; top_n[i] = end - at; break;
++			}
++		}
++		at = end;
++	}
++	static unsigned batch;
++	batch++;
++	say("tl: prof batch %u samples %u\n", batch, count);
++	for (unsigned i = 0; i < 30 && top_n[i]; i++) {
++		char line[960];
++		unsigned pct = top_n[i] * 10000 / count;
++		int used = snprintf(line, sizeof(line), "tl: prof %u.%02u%% ", pct / 100, pct % 100);
++		struct fprof_sample *s = &fprof_samples[top_at[i]];
++		for (unsigned j = 0; j < s->depth && used < 800; j++) {
++			Dl_info info;
++			const char *name = "unknown";
++			uintptr_t offset = s->pc[j];
++			if (dladdr((void *)s->pc[j], &info) != 0 && info.dli_fbase && info.dli_fname) {
++				const char *slash = strrchr(info.dli_fname, '/');
++				name = slash ? slash + 1 : info.dli_fname;
++				offset -= (uintptr_t)info.dli_fbase;
++			}
++			used += snprintf(line + used, sizeof(line) - (size_t)used, "%s%s+0x%llx",
++			    j ? " <- " : "", name, (unsigned long long)offset);
++		}
++		say("%s batch=%u hits=%u samples=%u\n", line, batch, top_n[i], count);
++	}
++	unsigned stack_hits = 0;
++	for (unsigned i = 0; i < 30; i++) stack_hits += top_n[i];
++	fprof_aggregate(count, batch, stack_hits);
++}
++
++static void *
++fprof_sampler(void *unused)
++{
++	(void)unused;
++	unsigned samples = 0, run = 0, wait = 0, errors = 0, suspend_errors = 0;
++	uint64_t last = now_us(), suspend_us = 0;
++	uint64_t stop_ticks = 0, state_ticks = 0, walk_ticks = 0, resume_ticks = 0, sampler_cpu_us = 0;
++	/* Warm the MIG reply port and lazy bindings before a target can be suspended. */
++	arm_thread_state64_t warm;
++	mach_msg_type_number_t warm_count = ARM_THREAD_STATE64_COUNT;
++	thread_t self = mach_thread_self();
++	(void)thread_get_state(self, ARM_THREAD_STATE64, (thread_state_t)&warm, &warm_count);
++	(void)thread_resume(self); /* Not suspended: expected failure, no state change. */
++	mach_port_deallocate(mach_task_self(), self);
++	for (;;) {
++		usleep(fprof_interval);
++		thread_basic_info_data_t info;
++		mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++		if (thread_info(fprof_target, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) {
++			errors++;
++		} else if (info.run_state != TH_STATE_RUNNING || info.suspend_count != 0) {
++			wait++;
++			__atomic_fetch_add(&fprof_wait_total, 1, __ATOMIC_RELAXED);
++		} else {
++			run++;
++			__atomic_fetch_add(&fprof_run_total, 1, __ATOMIC_RELAXED);
++			struct fprof_sample s = {{0}, 0};
++			arm_thread_state64_t state;
++			count = ARM_THREAD_STATE64_COUNT;
++			uint64_t began = now_us();
++			int64_t cpu_began = fprof_cpu_us();
++			uint64_t t0 = mach_absolute_time(), t1 = t0, t2 = t0, t3 = t0, t4;
++			if (thread_suspend(fprof_target) == KERN_SUCCESS) {
++				/* Warmed lock-free commpage timestamps; no formatting/allocation while suspended. */
++				t1 = mach_absolute_time();
++				if (thread_get_state(fprof_target, ARM_THREAD_STATE64, (thread_state_t)&state, &count) == KERN_SUCCESS) {
++					t2 = mach_absolute_time();
++					uintptr_t sp = arm_thread_state64_get_sp(state);
++					uintptr_t fp = arm_thread_state64_get_fp(state);
++					s.pc[s.depth++] = arm_thread_state64_get_pc(state);
++					s.pc[s.depth++] = arm_thread_state64_get_lr(state);
++					uintptr_t high = sp <= UINTPTR_MAX - 1048576 ? sp + 1048576 : sp;
++					if (high > fprof_stack_high) high = fprof_stack_high;
++					for (unsigned i = 0; i < 7 && sp >= fprof_stack_low && sp < high; i++) {
++						if ((fp & 15) || fp < sp || fp < fprof_stack_low || high < 16 || fp > high - 16) break;
++						volatile const uintptr_t *record = (volatile const uintptr_t *)fp;
++						uintptr_t next = record[0], lr = record[1];
++						if (!lr) break;
++						s.pc[s.depth++] = lr;
++						if (next <= fp) break;
++						sp = fp + 16; fp = next;
++					}
++				} else {
++					t2 = mach_absolute_time();
++					suspend_errors++;
++				}
++				t3 = mach_absolute_time();
++				kern_return_t resumed = thread_resume(fprof_target);
++				/* Do not continue a run after an unbalanced suspension. No retry with extra holds. */
++				if (resumed != KERN_SUCCESS) _exit(125);
++			} else {
++				t1 = t2 = t3 = mach_absolute_time();
++				suspend_errors++;
++			}
++			t4 = mach_absolute_time();
++			stop_ticks += t1 - t0; state_ticks += t2 - t1;
++			walk_ticks += t3 - t2; resume_ticks += t4 - t3;
++			int64_t cpu_end = fprof_cpu_us();
++			if (cpu_end >= cpu_began && cpu_began >= 0) sampler_cpu_us += cpu_end - cpu_began;
++			suspend_us += now_us() - began;
++			if (s.depth) fprof_samples[samples++] = s;
++		}
++		uint64_t now = now_us();
++		if (now - last >= 1000000) {
++			say("tl: prof state run %u wait %u total %u at %llu span_us %llu errors %u suspend_us %llu suspend_errors %u\n",
++			    run, wait, run + wait + errors, now, now - last, errors, suspend_us, suspend_errors);
++			say("tl: prof cost at %llu stop_us %llu state_us %llu walk_us %llu resume_us %llu cpu_us %llu wall_us %llu run %u\n",
++			    now, (unsigned long long)(((__uint128_t)stop_ticks * fprof_timebase.numer) / fprof_timebase.denom / 1000),
++			    (unsigned long long)(((__uint128_t)state_ticks * fprof_timebase.numer) / fprof_timebase.denom / 1000),
++			    (unsigned long long)(((__uint128_t)walk_ticks * fprof_timebase.numer) / fprof_timebase.denom / 1000),
++			    (unsigned long long)(((__uint128_t)resume_ticks * fprof_timebase.numer) / fprof_timebase.denom / 1000),
++			    (unsigned long long)sampler_cpu_us, (unsigned long long)suspend_us, run);
++			run = wait = errors = suspend_errors = 0; suspend_us = 0; last = now;
++			stop_ticks = state_ticks = walk_ticks = resume_ticks = sampler_cpu_us = 0;
++		}
++		if (samples == FPROF_SAMPLES) { fprof_report(samples); samples = 0; }
++	}
++	return NULL;
++}
++
++static void
++fprof_start(void)
++{
++	unsigned expected = 0;
++	if (!__atomic_compare_exchange_n(&fprof_started, &expected, 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
++	pthread_t self = pthread_self(), sampler;
++	__atomic_store_n(&fprof_pthread, self, __ATOMIC_RELEASE);
++	uintptr_t high = (uintptr_t)pthread_get_stackaddr_np(self);
++	size_t size = pthread_get_stacksize_np(self);
++	fprof_stack_high = high;
++	fprof_stack_low = size <= high ? high - size : high;
++	fprof_target = mach_thread_self();
++	if (pthread_create(&sampler, NULL, fprof_sampler, NULL) == 0) {
++		pthread_detach(sampler);
++		say("tl: prof enabled interval_us %u stack_bytes %zu state_semantics runnable\n", fprof_interval, size);
++	} else {
++		mach_port_deallocate(mach_task_self(), fprof_target);
++		say("tl: prof disabled sampler_create_failed\n");
++	}
++}
++
+ /* ---- a context -------------------------------------------------------------------------------- */
+ 
+ #define SLOTS           0x440           /* entries of the table: more than iOS's has (checked below) */
+@@ -230,13 +580,18 @@ struct image {
+ 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
+ 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
+ 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
++	bool swizzled;
++	int import_reason;
+ 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
+ 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
++	unsigned still_looks;
+ 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
+ 	uint64_t sum;                   /* ... and what it added up to */
+ 	GLenum to, internal, format, type;
+ 	uint32_t plane, seed;
+ 	GLsizei width, height;
++	GLint dmg[4];                   /* what was drawn into it since it was last sent out: x0, y0, x1, y1 (damage_added()) */
++	bool dmg_any, dmg_full;
+ };
+ 
+ struct eagl {
+@@ -305,6 +660,13 @@ struct eagl {
+ 	/* a frame's worth */
+ 	unsigned calls, draws, triangles, uploads, clears, last_draws;
+ 	uint64_t upload_bytes, began, attaching, flushing;
++	struct {
++		int cpu0;
++		int64_t began_cpu, last_cpu, pre_cpu, pre_run, pre_wait;
++		uint64_t last_run, last_wait;
++		uint64_t sum_us, sum_bytes;
++		unsigned sum_n, skip_n, still_n;
++	} prof;
+ 	/* everything so far */
+ 	unsigned frames, shaders, programs, errors, shared, refused;
+ 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
+@@ -334,6 +696,28 @@ static struct group_texture *group_of(struct eagl *e, GLuint texture);
+ static __thread struct eagl *current;
+ static struct eagl *contexts[8];
+ static uint32_t slot_calls[SLOTS];
++static uint64_t slot_us[SLOTS];         /* microseconds inside each entry (EXP-0125) */
++static uint64_t gl_in_calls_us;         /* ... and inside all of them, this frame */
++/*
++ * GPU submissions (selector 0x46 of the DRM shim's counters, tools/mesa/redwood-drm) made inside each
++ * entry, and the microseconds the kernel took for them (EXP-0174): which GL calls cause them.
++ */
++#define DRM_SUBMIT      0x46
++static const unsigned long *drm_calls, *drm_ticks, *drm_total;
++static uint32_t slot_kcalls[SLOTS];             /* kernel requests of any kind made inside each entry, and the microseconds they took (EXP-0175) */
++static uint64_t slot_kus[SLOTS];
++static unsigned long kcalls_began, kticks_began;
++/* the requests that matter, by the entry they were made in: [slot][which] (EXP-0175) */
++static const uint8_t req_numbers[] = { 0x09, 0x42, 0x43, 0x44, 0x46, 0x47, 0x7e };
++#define REQS    (sizeof(req_numbers) / sizeof(req_numbers[0]))
++static uint32_t slot_req_calls[SLOTS][REQS];
++static uint64_t slot_req_ticks[SLOTS][REQS];
++static unsigned long req_calls_began[REQS], req_ticks_began[REQS];
++static uint32_t slot_submits[SLOTS];
++static uint64_t slot_submit_us[SLOTS];
++static unsigned long submits_began, submit_ticks_began;
++static uint32_t submits_flush, submits_image, submits_fence;    /* ... and those of my_glFlush's own glFlush, frame_end's per-picture one and its fence */
++#define SUBMITS_NOW()   (drm_calls != NULL ? drm_calls[DRM_SUBMIT] : 0)
+ static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
+ static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
+ /*
+@@ -371,6 +755,9 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
+  */
+ static int fetch_offered = 1;
+ 
++#ifndef GL_LINEAR
++#define GL_LINEAR                       0x2601
++#endif
+ #define GL_SCISSOR_TEST                 0x0c11
+ #define GL_SCISSOR_BOX                  0x0c10
+ #define GL_COLOR_CLEAR_VALUE            0x0c22
+@@ -390,9 +777,17 @@ eagl_enter(struct eagl *e, unsigned offset)
+ 	}
+ 	slot_calls[offset / 8]++;
+ 	e->calls++;
+-	if (slow_calls_us != 0) {
+-		call_began_us = now_us();
++	if (drm_calls != NULL) {
++		submits_began = drm_calls[DRM_SUBMIT];
++		submit_ticks_began = drm_ticks[DRM_SUBMIT];
++		kcalls_began = drm_total[0];
++		kticks_began = drm_total[1];
++		for (unsigned i = 0; i < REQS; i++) {
++			req_calls_began[i] = drm_calls[req_numbers[i]];
++			req_ticks_began[i] = drm_ticks[req_numbers[i]];
++		}
+ 	}
++	call_began_us = now_us();
+ }
+ 
+ static void
+@@ -405,11 +800,35 @@ eagl_leave(struct eagl *e, unsigned offset)
+ 			say("redwood-gl: %s: error %#x\n", eagl_slot_name(offset), error);
+ 		}
+ 	}
+-	if (slow_calls_us != 0) {
++	{
+ 		uint64_t now = now_us();
+ 
++		slot_us[offset / 8] += now - call_began_us;
++		gl_in_calls_us += now - call_began_us;
++		if (drm_calls != NULL && drm_total[0] != kcalls_began) {
++			static mach_timebase_info_data_t kbase;
++
++			if (kbase.denom == 0) {
++				mach_timebase_info(&kbase);
++			}
++			for (unsigned i = 0; i < REQS; i++) {
++				slot_req_calls[offset / 8][i] += (uint32_t)(drm_calls[req_numbers[i]] - req_calls_began[i]);
++				slot_req_ticks[offset / 8][i] += drm_ticks[req_numbers[i]] - req_ticks_began[i];
++			}
++			slot_kcalls[offset / 8] += (uint32_t)(drm_total[0] - kcalls_began);
++			slot_kus[offset / 8] += (drm_total[1] - kticks_began) * kbase.numer / kbase.denom / 1000;
++		}
++		if (drm_calls != NULL && drm_calls[DRM_SUBMIT] != submits_began) {
++			static mach_timebase_info_data_t base;
++
++			if (base.denom == 0) {
++				mach_timebase_info(&base);
++			}
++			slot_submits[offset / 8] += (uint32_t)(drm_calls[DRM_SUBMIT] - submits_began);
++			slot_submit_us[offset / 8] += (drm_ticks[DRM_SUBMIT] - submit_ticks_began) * base.numer / base.denom / 1000;
++		}
+ 		/* "tl: slow NAME US at US, frame N": a call that took long, and when it ended (tools/frames.py) */
+-		if (now - call_began_us >= slow_calls_us) {
++		if (slow_calls_us != 0 && now - call_began_us >= slow_calls_us) {
+ 			say("tl: slow %s %llu at %llu, frame %u%s\n", eagl_slot_name(offset), now - call_began_us, now, e->frames + 1,
+ 			    e->in_frame ? "" : " (before its first draw)");
+ 		}
+@@ -508,6 +927,91 @@ summary(struct eagl *e)
+ 			say("redwood-gl:   %-28s %u\n", eagl_slot_name(offset), slot_calls[offset / 8]);
+ 		}
+ 	}
++	/* the entries by the time spent in them (EXP-0125) */
++	for (unsigned rank = 0; rank < 12; rank++) {
++		unsigned best = 0;
++
++		for (unsigned i = 1; i < SLOTS; i++) {
++			if (slot_us[i] > slot_us[best]) {
++				best = i;
++			}
++		}
++		if (slot_us[best] == 0) {
++			break;
++		}
++		say("redwood-gl: time %2u: %-28s %llu us in %u calls (%llu us a call)\n", rank + 1, eagl_slot_name(best * 8), slot_us[best],
++		    slot_calls[best], slot_us[best] / (slot_calls[best] ? slot_calls[best] : 1));
++		slot_us[best] = 0;      /* (so that the next is the next: the totals restart after each summary) */
++	}
++	/* time in the kernel (any request) by the call it was made in, and by request (EXP-0175) */
++	static mach_timebase_info_data_t kbase2;
++
++	if (kbase2.denom == 0) {
++		mach_timebase_info(&kbase2);
++	}
++	for (unsigned rank = 0; drm_calls != NULL && rank < 8; rank++) {
++		unsigned best = 0;
++
++		for (unsigned i = 1; i < SLOTS; i++) {
++			if (slot_kus[i] > slot_kus[best]) {
++				best = i;
++			}
++		}
++		if (slot_kus[best] == 0) {
++			break;
++		}
++		say("redwood-gl: kernel %u: %-28s %llu us in %u kernel requests (%llu us a request)\n", rank + 1,
++		    eagl_slot_name(best * 8), slot_kus[best], slot_kcalls[best], slot_kus[best] / slot_kcalls[best]);
++		if (rank < 4) {
++			say("redwood-gl:   %s by request:", eagl_slot_name(best * 8));
++			for (unsigned i = 0; i < REQS; i++) {
++				if (slot_req_calls[best][i] != 0) {
++					say(" %#x %u/%llu us", req_numbers[i], slot_req_calls[best][i], (unsigned long long)(slot_req_ticks[best][i] * kbase2.numer / kbase2.denom / 1000));
++				}
++			}
++			say("\n");
++		}
++		memset(slot_req_calls[best], 0, sizeof(slot_req_calls[best]));
++		memset(slot_req_ticks[best], 0, sizeof(slot_req_ticks[best]));
++		slot_kus[best] = 0;
++		slot_kcalls[best] = 0;
++	}
++	if (drm_calls != NULL) {
++		static mach_timebase_info_data_t sbase;
++
++		if (sbase.denom == 0) {
++			mach_timebase_info(&sbase);
++		}
++		for (unsigned i = 0; i < 256; i++) {
++			if (drm_calls[i] != 0 && drm_ticks[i] * sbase.numer / sbase.denom / 1000 >= 20000) {
++				say("redwood-gl: request %#x: %lu calls, %llu us in the kernel (%llu us each)\n", i, drm_calls[i],
++				    (unsigned long long)(drm_ticks[i] * sbase.numer / sbase.denom / 1000),
++				    (unsigned long long)(drm_ticks[i] * sbase.numer / sbase.denom / 1000 / drm_calls[i]));
++			}
++		}
++	}
++	/* GPU submissions by the call they were made in (EXP-0174) */
++	if (drm_calls != NULL) {
++		say("redwood-gl: submits: %lu in all; in glFlush's own glFlush %u, in frame_end after a picture %u, in its fence %u; "
++		    "selectors: wait %lu, cpu_prep %lu, new %lu\n", drm_calls[DRM_SUBMIT], submits_flush, submits_image, submits_fence,
++		    drm_calls[0x47], drm_calls[0x44], drm_calls[0x42]);
++	}
++	for (unsigned rank = 0; drm_calls != NULL && rank < 8; rank++) {
++		unsigned best = 0;
++
++		for (unsigned i = 1; i < SLOTS; i++) {
++			if (slot_submits[i] > slot_submits[best]) {
++				best = i;
++			}
++		}
++		if (slot_submits[best] == 0) {
++			break;
++		}
++		say("redwood-gl: submits %u: %-28s %u in %u calls, %llu us in the kernel (%llu us each)\n", rank + 1, eagl_slot_name(best * 8),
++		    slot_submits[best], slot_calls[best], slot_submit_us[best], slot_submit_us[best] / slot_submits[best]);
++		slot_submits[best] = 0;
++		slot_submit_us[best] = 0;
++	}
+ }
+ 
+ /* ---- IOSurfaces ----------------------------------------------------------------------------------- */
+@@ -535,12 +1039,14 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
+ 		}
+ 		image = &e->images[e->image_count++];
+ 	} else {
++		if (image->swizzled && !redwood_gl_surface_swizzle(e->gl, 0)) return NULL;
+ 		if (image->mirror != 0) {
+ 			glDeleteTextures(1, &image->mirror);
+ 		}
+ 		CFRelease(image->surface);
+ 	}
+ 	memset(image, 0, sizeof(*image));
++	image->import_reason = -1;
+ 	image->texture = texture;
+ 	image->surface = (IOSurfaceRef)CFRetain(surface);
+ 	return image;
+@@ -621,18 +1127,186 @@ surface_mirrored(struct eagl *e, struct image *image)
+  * Make a texture, which is bound, of its IOSurface's own memory, if that is what is asked for
+  * (the whole of a surface of blue-first pixels, the same way up) and the library can do it.
+  */
++enum { IMP_SHARE_OFF, IMP_INVERT, IMP_ALPHA_FIRST, IMP_FORMAT, IMP_TYPE, IMP_PLANE, IMP_SIZE, IMP_LIB_REFUSED, IMP_REASONS };
++static const char *import_reasons[] = { "share_off", "invert", "alpha_first", "format", "type", "plane", "size", "lib_refused" };
++static uint64_t import_counts[IMP_REASONS], import_shared, import_copied, import_bytes, import_us, import_last;
++
++
++enum { IMPORT_ATTACH, IMPORT_TEXIMAGE, IMPORT_SEED, IMPORT_SUM, IMPORT_OTHER };
++static const char *import_triggers[] = { "attach", "teximage", "bind-seed", "bind-sum", "other" };
++#define IMPORT_GROUPS 512
++struct import_group {
++	int width, height, reason;
++	uint32_t fourcc;
++	unsigned trigger;
++	uint64_t count, bytes, us, gpu, gpu_us, failed, failed_us;
++};
++static struct import_group import_groups[IMPORT_GROUPS], import_overflow;
++static unsigned import_group_count;
++static uint64_t import_details, swizzle_ok, swizzle_fail, swizzle_alpha, swizzle_rgba;
++static pthread_mutex_t import_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++/* TARGET_COPY_STATS_BEGIN */
++enum { TGT_LOCK, TGT_STORAGE, TGT_READ, TGT_DRAW, TGT_GL, TGT_RESTORE, TGT_REASONS };
++static const char *target_copy_reasons[] = { "lock", "storage", "read-fbo", "draw-fbo", "gl", "restore" };
++static uint64_t target_copy_gpu, target_copy_fallback, target_copy_us, target_copy_fail_us;
++static uint64_t target_copy_counts[TGT_REASONS], target_seed_n, target_seed_bytes, target_seed_us;
++
++static void
++target_copy_report(uint64_t at)
++{
++	if (!(ffix & 8)) return;
++	char reasons[256]; size_t used = 0;
++	for (unsigned i = 0; i < TGT_REASONS; i++)
++		used += (size_t)snprintf(reasons + used, sizeof(reasons) - used, "%s%s:%llu", i ? "," : "", target_copy_reasons[i],
++		    __atomic_exchange_n(&target_copy_counts[i], 0, __ATOMIC_RELAXED));
++	say("tl: tgtcopy gpu=%llu fallback=%llu reason=%s us=%llu fallback_us=%llu seed_n=%llu seed_bytes=%llu seed_us=%llu at=%llu\n",
++	    __atomic_exchange_n(&target_copy_gpu, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&target_copy_fallback, 0, __ATOMIC_RELAXED), reasons,
++	    __atomic_exchange_n(&target_copy_us, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&target_copy_fail_us, 0, __ATOMIC_RELAXED),
++	    __atomic_exchange_n(&target_seed_n, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&target_seed_bytes, 0, __ATOMIC_RELAXED),
++	    __atomic_exchange_n(&target_seed_us, 0, __ATOMIC_RELAXED), at);
++}
++/* TARGET_COPY_STATS_END */
++
++static const char *
++import_reason_name(int reason)
++{
++	return reason >= 0 && reason < IMP_REASONS ? import_reasons[reason] : "none";
++}
++
++static void
++import_detail(struct eagl *e, struct image *image, unsigned trigger, size_t row, uint64_t bytes, uint64_t us, const char *outcome)
++{
++	if (!fprof_interval) return;
++	uint32_t fourcc = IOSurfaceGetPixelFormat(image->surface);
++	pthread_mutex_lock(&import_mutex);
++	uint64_t sequence = ++import_details;
++	if (sequence <= 300) {
++		char code[5];
++		for (unsigned i = 0; i < 4; i++) {
++			unsigned c = (fourcc >> (24 - 8 * i)) & 255;
++			code[i] = c >= 33 && c <= 126 ? (char)c : '.';
++		}
++		code[4] = 0;
++		say("tl: impx seq=%llu at=%llu frame=%u trigger=%s id=%u w=%d h=%d bpr=%zu fourcc=%08x code=%s "
++		    "format=%x type=%x internal=%x alpha_first=%u invert=%u wrapped=%u target=%u painted=%u reason=%s bytes=%llu us=%llu outcome=%s\n",
++		    sequence, now_us(), e->frames + 1, import_triggers[trigger], IOSurfaceGetID(image->surface), image->width, image->height,
++		    row, fourcc, code, image->format, image->type, image->internal, image->alpha_first, image->invert,
++		    image->wrapped, image->target, image->painted, import_reason_name(image->import_reason), bytes, us, outcome);
++	} else {
++		unsigned i;
++		for (i = 0; i < import_group_count; i++) {
++			struct import_group *g = &import_groups[i];
++			if (g->width == image->width && g->height == image->height && g->fourcc == fourcc &&
++			    g->reason == image->import_reason && g->trigger == trigger) break;
++		}
++		struct import_group *g = &import_overflow;
++		if (i < IMPORT_GROUPS) {
++			g = &import_groups[i];
++			if (i == import_group_count) {
++				import_group_count++;
++				*g = (struct import_group){ .width=image->width, .height=image->height, .fourcc=fourcc,
++				    .reason=image->import_reason, .trigger=trigger };
++			}
++		}
++		g->count++;
++		if (strcmp(outcome, "gpu-copied") == 0) { g->gpu++; g->gpu_us += us; }
++		else if (strcmp(outcome, "copied") == 0) { g->bytes += bytes; g->us += us; }
++		else { g->failed++; g->failed_us += us; }
++	}
++	pthread_mutex_unlock(&import_mutex);
++}
++
++static void
++import_aggregate_report(uint64_t at)
++{
++	pthread_mutex_lock(&import_mutex);
++	for (unsigned rank = 0; rank < 20 && rank < import_group_count; rank++) {
++		unsigned best = rank;
++		for (unsigned i = rank + 1; i < import_group_count; i++)
++			if (import_groups[i].bytes > import_groups[best].bytes ||
++			    (import_groups[i].bytes == import_groups[best].bytes && import_groups[i].us > import_groups[best].us)) best = i;
++		struct import_group tmp = import_groups[rank]; import_groups[rank] = import_groups[best]; import_groups[best] = tmp;
++		struct import_group *g = &import_groups[rank];
++		say("tl: impagg at=%llu rank=%u w=%d h=%d fourcc=%08x reason=%s trigger=%s n=%llu bytes=%llu us=%llu gpu=%llu gpu_us=%llu failed=%llu failed_us=%llu\n",
++		    at, rank+1, g->width, g->height, g->fourcc, import_reason_name(g->reason), import_triggers[g->trigger], g->count, g->bytes, g->us,
++		    g->gpu, g->gpu_us, g->failed, g->failed_us);
++	}
++	for (unsigned i = 20; i < import_group_count; i++) {
++		import_overflow.count += import_groups[i].count;
++		import_overflow.bytes += import_groups[i].bytes;
++		import_overflow.us += import_groups[i].us;
++		import_overflow.gpu += import_groups[i].gpu;
++		import_overflow.gpu_us += import_groups[i].gpu_us;
++		import_overflow.failed += import_groups[i].failed;
++		import_overflow.failed_us += import_groups[i].failed_us;
++	}
++	if (import_overflow.count)
++		say("tl: impagg at=%llu rank=other n=%llu bytes=%llu us=%llu gpu=%llu gpu_us=%llu failed=%llu failed_us=%llu\n", at,
++		    import_overflow.count, import_overflow.bytes, import_overflow.us, import_overflow.gpu, import_overflow.gpu_us,
++		    import_overflow.failed, import_overflow.failed_us);
++	import_group_count = 0;
++	memset(&import_overflow, 0, sizeof(import_overflow));
++	pthread_mutex_unlock(&import_mutex);
++	say("tl: impswz at=%llu ok=%llu fail=%llu kind=alpha_first:%llu,rgba:%llu\n", at,
++	    __atomic_exchange_n(&swizzle_ok, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&swizzle_fail, 0, __ATOMIC_RELAXED),
++	    __atomic_exchange_n(&swizzle_alpha, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&swizzle_rgba, 0, __ATOMIC_RELAXED));
++}
++
++static void
++import_report(void)
++{
++	if (!fprof_interval) return;
++	uint64_t now = now_us(), old = __atomic_load_n(&import_last, __ATOMIC_RELAXED);
++	if (now - old < 1000000 || !__atomic_compare_exchange_n(&import_last, &old, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
++	import_aggregate_report(now);
++	target_copy_report(now);
++	char reasons[320]; int used = 0;
++	for (unsigned i = 0; i < IMP_REASONS; i++)
++		used += snprintf(reasons + used, sizeof(reasons) - (size_t)used, "%s%s:%llu", i ? "," : "", import_reasons[i],
++		    (unsigned long long)__atomic_exchange_n(&import_counts[i], 0, __ATOMIC_RELAXED));
++	say("tl: imp shared=%llu copied=%llu reasons=%s bytes=%llu us=%llu at=%llu\n",
++	    (unsigned long long)__atomic_exchange_n(&import_shared, 0, __ATOMIC_RELAXED),
++	    (unsigned long long)__atomic_exchange_n(&import_copied, 0, __ATOMIC_RELAXED), reasons,
++	    (unsigned long long)__atomic_exchange_n(&import_bytes, 0, __ATOMIC_RELAXED),
++	    (unsigned long long)__atomic_exchange_n(&import_us, 0, __ATOMIC_RELAXED), (unsigned long long)now);
++}
++
+ static bool
+ surface_shared(struct eagl *e, struct image *image)
+ {
+ 	IOSurfaceRef surface = image->surface;
+-
+-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
+-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+-	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
+-	    !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
++	int reason = -1;
++	bool swizzle = (ffix & 4) && share_surfaces && !image->invert &&
++	    (image->alpha_first || image->format == GL_RGBA) &&
++	    (image->internal == GL_BGRA || image->internal == GL_RGBA || image->internal == 0x8058) &&
++	    (image->format == GL_BGRA || image->format == GL_RGBA) && image->type == GL_UNSIGNED_BYTE &&
++	    image->plane == 0 && IOSurfaceGetPlaneCount(surface) == 0 && IOSurfaceGetBytesPerElement(surface) == 4 &&
++	    (size_t)image->width == IOSurfaceGetWidth(surface) && (size_t)image->height == IOSurfaceGetHeight(surface);
++	if (!share_surfaces) reason = IMP_SHARE_OFF;
++	else if (image->invert) reason = IMP_INVERT;
++	else if (image->alpha_first && !swizzle) reason = IMP_ALPHA_FIRST;
++	else if (image->format != GL_BGRA && !swizzle) reason = IMP_FORMAT;
++	else if (image->type != GL_UNSIGNED_BYTE) reason = IMP_TYPE;
++	else if (image->plane != 0) reason = IMP_PLANE;
++	else if ((size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) reason = IMP_SIZE;
++	else if (swizzle && !redwood_gl_swizzle_supported(e->gl)) reason = IMP_LIB_REFUSED;
++	else if (!redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) reason = IMP_LIB_REFUSED;
++	else if (swizzle) {
++		image->swizzled = true;
++		if (!redwood_gl_surface_swizzle(e->gl, image->alpha_first ? 2 : 1)) reason = IMP_LIB_REFUSED;
++	}
++	image->import_reason = reason;
++	if (swizzle && fprof_interval) {
++		__atomic_fetch_add(reason < 0 ? &swizzle_ok : &swizzle_fail, 1, __ATOMIC_RELAXED);
++		if (reason < 0) __atomic_fetch_add(image->alpha_first ? &swizzle_alpha : &swizzle_rgba, 1, __ATOMIC_RELAXED);
++	}
++	if (reason >= 0) {
++		if (fprof_interval) __atomic_fetch_add(&import_counts[reason], 1, __ATOMIC_RELAXED);
+ 		e->refused++;
+ 		return false;
+ 	}
++	if (fprof_interval) __atomic_fetch_add(&import_shared, 1, __ATOMIC_RELAXED);
+ 	image->shared = true;
+ 	e->shared++;
+ 	return true;
+@@ -647,7 +1321,7 @@ surface_shared(struct eagl *e, struct image *image)
+  * if the sum has changed.
+  */
+ static bool
+-surface_changed(struct eagl *e, struct image *image)
++surface_changed(struct eagl *e, struct image *image, bool fallback)
+ {
+ 	IOSurfaceRef surface = image->surface;
+ 	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
+@@ -656,25 +1330,42 @@ surface_changed(struct eagl *e, struct image *image)
+ 	uint64_t sum = size, word;
+ 
+ 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
++		if (fprof_interval) e->prof.skip_n++;
++		return false;
++	}
++	if ((ffix & 1) && fallback && image->still_looks >= STILL_LOOKS &&
++	    (e->frames + IOSurfaceGetID(surface)) % STILL_EVERY != 0) {
++		image->looked = e->frames + 1;
++		if (fprof_interval) e->prof.still_n++;
+ 		return false;
+ 	}
++	uint64_t measured = fprof_interval ? now_us() : 0;
+ 	image->looked = e->frames + 1;
+ 	for (size_t at = 0; at + 8 <= size; at += 8) {
+ 		memcpy(&word, base + at, 8);
+ 		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+ 		sum ^= sum >> 29;
+ 	}
++	if (fprof_interval) {
++		e->prof.sum_us += now_us() - measured;
++		e->prof.sum_bytes += size & ~(size_t)7;
++		e->prof.sum_n++;
++	}
+ 	if (sum == image->sum) {
++		if ((ffix & 1) && fallback && image->still_looks < STILL_LOOKS) image->still_looks++;
+ 		return false;
+ 	}
++	if (ffix & 1) image->still_looks = 0;
+ 	image->sum = sum;
+ 	return true;
+ }
+ 
+ /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
+ static void
+-surface_to_texture(struct eagl *e, struct image *image)
++surface_to_texture(struct eagl *e, struct image *image, unsigned trigger)
+ {
++	uint64_t import_began = fprof_interval ? now_us() : 0;
++	if (ffix & 1) image->still_looks = 0;
+ 	IOSurfaceRef surface = image->surface;
+ 	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
+ 	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
+@@ -686,7 +1377,15 @@ surface_to_texture(struct eagl *e, struct image *image)
+ 	if (image->shared) {
+ 		return;
+ 	}
++	if (image->swizzled) {
++		if (!redwood_gl_surface_swizzle(e->gl, 0)) {
++			say("redwood-gl: texture sampling state could not be reset; upload refused\n");
++			return;
++		}
++		image->swizzled = false;
++	}
+ 	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
++		import_detail(e, image, trigger, row, 0, fprof_interval ? now_us() - import_began : 0, "lock-failed");
+ 		say("redwood-gl: an IOSurface cannot be locked\n");
+ 		return;
+ 	}
+@@ -749,6 +1448,280 @@ surface_to_texture(struct eagl *e, struct image *image)
+ 	image->seed = IOSurfaceGetSeed(surface);
+ 	e->uploads++;
+ 	e->upload_bytes += row * (size_t)image->height;
++	if (fprof_interval) {
++		__atomic_fetch_add(&import_copied, 1, __ATOMIC_RELAXED);
++		__atomic_fetch_add(&import_bytes, row * (size_t)image->height, __ATOMIC_RELAXED);
++		uint64_t elapsed = now_us() - import_began;
++		if ((ffix & 8) && (trigger == IMPORT_SEED || trigger == IMPORT_OTHER)) {
++			__atomic_fetch_add(&target_seed_n, 1, __ATOMIC_RELAXED);
++			__atomic_fetch_add(&target_seed_bytes, row * (size_t)image->height, __ATOMIC_RELAXED);
++			__atomic_fetch_add(&target_seed_us, elapsed, __ATOMIC_RELAXED);
++		}
++		__atomic_fetch_add(&import_us, elapsed, __ATOMIC_RELAXED);
++		import_detail(e, image, trigger, row, row * (size_t)image->height, elapsed, "copied");
++	}
++}
++
++/* Initial target contents from the surface's memory; no CPU pixel upload on success. */
++static bool
++surface_from_mirror(struct eagl *e, struct image *image)
++{
++	GLint read = 0, draw = 0, bound = 0, unpack = 0;
++	GLboolean boxed = glIsEnabled(GL_SCISSOR_TEST);
++	unsigned reason = TGT_GL;
++	bool copied = false;
++	uint64_t began = fprof_interval ? now_us() : 0;
++	IOSurfaceRef surface = image->surface;
++
++	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++	if (glGetError() != 0) goto done;
++	glBindTexture(GL_TEXTURE_2D, image->texture);
++	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
++	    image->format, image->type, NULL);
++	reason = TGT_STORAGE;
++	if (glGetError() != 0) goto done;
++	if (e->reader == 0) glGenFramebuffers(1, &e->reader);
++	if (e->writer == 0) glGenFramebuffers(1, &e->writer);
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
++	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
++	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
++	reason = TGT_READ;
++	if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) goto done;
++	reason = TGT_DRAW;
++	if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) goto done;
++	reason = TGT_GL;
++	if (glGetError() != 0) goto done;
++	/* Announce the CPU contents even when this client's surface BO already exists. */
++	reason = TGT_LOCK;
++	if (IOSurfaceLock(surface, 0, NULL) != 0) goto done;
++	if (IOSurfaceUnlock(surface, 0, NULL) != 0) goto done;
++	if (boxed) glDisable(GL_SCISSOR_TEST);
++	glBlitFramebuffer(0, image->invert ? image->height : 0, image->width, image->invert ? 0 : image->height,
++	    0, 0, image->width, image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++	reason = TGT_GL;
++	if (glGetError() != 0) goto done;
++	copied = true;
++done:
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
++	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++	(boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
++	if (glGetError() != 0) { copied = false; reason = TGT_RESTORE; }
++	if (copied) image->seed = IOSurfaceGetSeed(surface);
++	if (fprof_interval) {
++		uint64_t elapsed = now_us() - began;
++		if (copied) {
++			__atomic_fetch_add(&target_copy_gpu, 1, __ATOMIC_RELAXED);
++			__atomic_fetch_add(&target_copy_us, elapsed, __ATOMIC_RELAXED);
++			import_detail(e, image, IMPORT_ATTACH, IOSurfaceGetBytesPerRow(surface), 0, elapsed, "gpu-copied");
++		} else {
++			__atomic_fetch_add(&target_copy_fallback, 1, __ATOMIC_RELAXED);
++			__atomic_fetch_add(&target_copy_counts[reason], 1, __ATOMIC_RELAXED);
++			__atomic_fetch_add(&target_copy_fail_us, elapsed, __ATOMIC_RELAXED);
++		}
++	}
++	return copied;
++}
++
++/* Pointers in the CPU upload must not be interpreted as offsets into an unpack buffer. */
++static void
++surface_target_fallback(struct eagl *e, struct image *image)
++{
++	GLint unpack = 0;
++	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++	surface_changed(e, image, false);
++	surface_to_texture(e, image, IMPORT_ATTACH);
++	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++}
++
++/*
++ * What a frame changed of the display's picture, for the display driver to put only that on the panel
++ * (kRedwoodDamage = 0x7c of the GPU service; boot-arg gldamage=0: the whole picture, always). The box is the
++ * scissor box CoreAnimation draws inside, or all of it where there is none.
++ */
++static int damage_on = 1;
++static io_connect_t damage_connection;
++static int damage_asked;
++
++static void
++damage_added(struct image *image)
++{
++	GLint box[4];
++
++	if (!damage_on || !image->target || image->width < 1000 || image->height < 2000) {
++		return;
++	}
++	if (!glIsEnabled(GL_SCISSOR_TEST)) {
++		image->dmg_full = true;
++		return;
++	}
++	glGetIntegerv(GL_SCISSOR_BOX, box);
++	if (box[2] <= 0 || box[3] <= 0) {
++		return;
++	}
++	if (!image->dmg_any) {
++		image->dmg[0] = box[0];
++		image->dmg[1] = box[1];
++		image->dmg[2] = box[0] + box[2];
++		image->dmg[3] = box[1] + box[3];
++		image->dmg_any = true;
++	} else {
++		image->dmg[0] = box[0] < image->dmg[0] ? box[0] : image->dmg[0];
++		image->dmg[1] = box[1] < image->dmg[1] ? box[1] : image->dmg[1];
++		image->dmg[2] = box[0] + box[2] > image->dmg[2] ? box[0] + box[2] : image->dmg[2];
++		image->dmg[3] = box[1] + box[3] > image->dmg[3] ? box[1] + box[3] : image->dmg[3];
++	}
++}
++
++/* The connection to the kernel's GPU service, for the requests that are not the library's (damage, the scaled frame). */
++static io_connect_t
++gpu_connection(void)
++{
++	if (damage_connection == 0 && !damage_asked) {
++		io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
++
++		damage_asked = 1;
++		if (service != 0) {
++			if (IOServiceOpen(service, mach_task_self(), 0, &damage_connection) != 0) {
++				damage_connection = 0;
++			}
++			IOObjectRelease(service);
++		}
++	}
++	return damage_connection;
++}
++
++static void
++damage_send(struct image *image)
++{
++	struct { int32_t box[4]; uint32_t full; } call = { { 0, 0, 0, 0 }, 1 };
++
++	if (!damage_on || !image->target || image->width < 1000 || image->height < 2000) {
++		return;
++	}
++	gpu_connection();
++	if (damage_connection == 0) {
++		return;
++	}
++	if (image->dmg_any && !image->dmg_full) {
++		/* (a texture's rows count from the bottom; the surface's memory from the top where the frame is copied upside down) */
++		GLint y0 = image->dmg[1] < 0 ? 0 : image->dmg[1], y1 = image->dmg[3] > image->height ? image->height : image->dmg[3];
++		GLint x0 = image->dmg[0] < 0 ? 0 : image->dmg[0], x1 = image->dmg[2] > image->width ? image->width : image->dmg[2];
++
++		call.box[0] = x0;
++		call.box[1] = image->invert ? image->height - y1 : y0;
++		call.box[2] = x1 - x0;
++		call.box[3] = y1 - y0;
++		call.full = call.box[2] <= 0 || call.box[3] <= 0;
++	}
++	image->dmg_any = image->dmg_full = false;
++	IOConnectCallStructMethod(damage_connection, 0x7c, &call, sizeof(call), NULL, NULL);
++}
++
++/*
++ * The frame, scaled to the panel by the GPU (boot-arg glscan=0: not). The frame is a texture of the library's own, of
++ * the iPhone's size; the panel is smaller, and the display driver used to scale it with the processor: 19 ms a frame,
++ * more than a refresh, so that frames came 30 a second (EXP-0125). Now the GPU scales it into a surface of the
++ * panel's size (the kernel says what that is), once a frame, and the display driver only copies it into the panel.
++ */
++static int scan_on = 1;
++static IOSurfaceRef scan_surface;
++static GLuint scan_texture;
++static GLsizei scan_width, scan_height;
++static int scan_tried;
++static bool scan_pending;
++
++static bool
++scan_call(uint32_t op, uint32_t surface, uint32_t *width, uint32_t *height)
++{
++	struct { uint32_t op, surface, width, height; } call = { op, surface, 0, 0 };
++	size_t size = sizeof(call);
++	io_connect_t connection = gpu_connection();
++
++	if (connection == 0 || IOConnectCallStructMethod(connection, 0x7b, &call, sizeof(call), &call, &size) != 0) {
++		return false;
++	}
++	if (width != NULL) {
++		*width = call.width;
++		*height = call.height;
++	}
++	return true;
++}
++
++static bool
++scan_ready(struct eagl *e)
++{
++	uint32_t width = 0, height = 0;
++	GLint bound = 0;
++	CFMutableDictionaryRef properties;
++	int32_t values[6];
++	static const CFStringRef *keys[6];
++	(void)keys;
++
++	if (!scan_on) {
++		return false;
++	}
++	if (scan_texture != 0) {
++		return true;
++	}
++	if (scan_tried) {
++		return false;
++	}
++	scan_tried = 1;
++	if (!scan_call(0, 0, &width, &height) || width == 0 || height == 0) {
++		scan_on = 0;
++		return false;
++	}
++	values[0] = (int32_t)width;
++	values[1] = (int32_t)height;
++	values[2] = 4;
++	values[3] = (int32_t)((width * 4 + 255) & ~255u);       /* (the GPU's rows are multiples of 256 bytes) */
++	values[4] = 0x42475241;                                 /* 'BGRA' */
++	values[5] = values[3] * (int32_t)height;
++	properties = CFDictionaryCreateMutable(NULL, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++	{
++		const CFStringRef names[6] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
++		    kIOSurfacePixelFormat, kIOSurfaceAllocSize };
++
++		for (int i = 0; i < 6; i++) {
++			CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt32Type, &values[i]);
++
++			CFDictionarySetValue(properties, names[i], number);
++			CFRelease(number);
++		}
++	}
++	scan_surface = IOSurfaceCreate(properties);
++	CFRelease(properties);
++	if (scan_surface == NULL) {
++		say("redwood-gl: glscan: no IOSurface of %u x %u\n", width, height);
++		scan_on = 0;
++		return false;
++	}
++	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++	glGenTextures(1, &scan_texture);
++	glBindTexture(GL_TEXTURE_2D, scan_texture);
++	if (!redwood_gl_surface_texture(e->gl, IOSurfaceGetID(scan_surface)) || !scan_call(1, IOSurfaceGetID(scan_surface), NULL, NULL)) {
++		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++		glDeleteTextures(1, &scan_texture);
++		scan_texture = 0;
++		CFRelease(scan_surface);
++		scan_surface = NULL;
++		scan_on = 0;
++		say("redwood-gl: glscan: the GPU cannot take the surface (%u x %u, %d bytes a row)\n", width, height, values[3]);
++		return false;
++	}
++	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++	scan_width = (GLsizei)width;
++	scan_height = (GLsizei)height;
++	say("redwood-gl: glscan: the frame is scaled by the GPU to %u x %u (%d bytes a row)\n", width, height, values[3]);
++	return true;
+ }
+ 
+ /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
+@@ -760,6 +1733,7 @@ target_to_surface(struct eagl *e, struct image *image)
+ 	uint8_t *base;
+ 
+ 	image->drawn = false;
++	damage_send(image);
+ 	if (image->mirror != 0) {
+ 		GLint read = 0, draw = 0;
+ 
+@@ -778,6 +1752,13 @@ target_to_surface(struct eagl *e, struct image *image)
+ 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+ 		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
+ 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++		if (image->width >= 1000 && image->height >= 2000 && scan_ready(e)) {
++			/* ... and scaled to the panel's size, for the display driver to copy */
++			glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scan_texture, 0);
++			glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? scan_height : 0, scan_width,
++			    image->invert ? 0 : scan_height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
++			scan_pending = true;
++		}
+ 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+ 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+ 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+@@ -979,6 +1960,17 @@ frame_begin(struct eagl *e)
+ 	}
+ 	e->in_frame = true;
+ 	e->began = now_us();
++	if (fprof_interval) {
++		fprof_start();
++		e->prof.cpu0 = fprof_cpu();
++		e->prof.began_cpu = fprof_cpu_us();
++		e->prof.pre_cpu = e->prof.last_cpu > 0 && e->prof.began_cpu >= e->prof.last_cpu ?
++		    e->prof.began_cpu - e->prof.last_cpu : -1;
++		pthread_t owner = __atomic_load_n(&fprof_pthread, __ATOMIC_ACQUIRE);
++		bool primary = owner && pthread_equal(pthread_self(), owner);
++		e->prof.pre_run = primary && e->prof.last_cpu > 0 ? (int64_t)(__atomic_load_n(&fprof_run_total, __ATOMIC_RELAXED) - e->prof.last_run) : -1;
++		e->prof.pre_wait = primary && e->prof.last_cpu > 0 ? (int64_t)(__atomic_load_n(&fprof_wait_total, __ATOMIC_RELAXED) - e->prof.last_wait) : -1;
++	}
+ 	eagl_tracing = e->frames + 1 >= trace_first && e->frames + 1 <= trace_last;
+ 	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws == trace_draws) || trace_function_met) {
+ 		trace_left = trace_frames;      /* (once) */
+@@ -1011,7 +2003,7 @@ frame_begin(struct eagl *e)
+ 			rebound = true;
+ 		}
+ 		glBindTexture(image->to, image->texture);
+-		surface_to_texture(e, image);
++		surface_to_texture(e, image, IMPORT_OTHER);
+ 	}
+ 	if (rebound) {
+ 		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+@@ -1027,16 +2019,23 @@ static void
+ frame_end(struct eagl *e, bool finished)
+ {
+ 	static unsigned unfollowed;
++	static uint64_t last_end;
+ 	uint64_t before, waited, after;
+ 	unsigned copied = 0, in_place = 0;
++	int prof_cpu1 = -1;
++	int64_t prof_cpu = -1;
++	uint64_t prof_run = 0, prof_wait = 0;
+ 
+ 	clear_now(e);
+ 	before = now_us();
+ 	for (unsigned i = 0; i < e->image_count; i++) {
+ 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
++			unsigned long submits = SUBMITS_NOW();
++
+ 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
+ 			in_place++;
+ 			glFlush();                              /* (also after a glFinish: the copy is new since) */
++			submits_image += (uint32_t)(SUBMITS_NOW() - submits);
+ 		}
+ 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+ 			in_place++;
+@@ -1053,12 +2052,18 @@ frame_end(struct eagl *e, bool finished)
+ 		 * the cause of frames with parts missing; that was drawing into the surface itself, see
+ 		 * blit_targets.)
+ 		 */
++		unsigned long submits = SUBMITS_NOW();
+ 		GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+ 
+ 		if (sync != NULL) {
+ 			(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+ 			glDeleteSync(sync);
+ 		}
++		submits_fence += (uint32_t)(SUBMITS_NOW() - submits);
++	}
++	if (scan_pending) {
++		scan_pending = false;
++		scan_call(2, IOSurfaceGetID(scan_surface), NULL, NULL);        /* (the batch with the scaling is with the kernel by now) */
+ 	}
+ 	waited = now_us();
+ 	for (unsigned i = 0; i < e->image_count; i++) {
+@@ -1074,12 +2079,31 @@ frame_end(struct eagl *e, bool finished)
+ 		return;
+ 	}
+ 	after = now_us();
++	if (fprof_interval) {
++		prof_cpu1 = fprof_cpu(); prof_cpu = fprof_cpu_us();
++		prof_run = __atomic_load_n(&fprof_run_total, __ATOMIC_RELAXED);
++		prof_wait = __atomic_load_n(&fprof_wait_total, __ATOMIC_RELAXED);
++	}
+ 	e->in_frame = false;
+ 	e->frames++;
+ 	if (latency_lines) {
+ 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
+ 		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
+ 	}
++	if (fprof_interval) {
++		int cpu1 = prof_cpu1;
++		int64_t cpu = prof_cpu;
++		int64_t elapsed = cpu >= e->prof.began_cpu && e->prof.began_cpu >= 0 ? cpu - e->prof.began_cpu : -1;
++		say("tl: h %u cpu0 %d cpu1 %d thr_us %lld sum_us %llu sum_kb %llu sum_n %u skip_n %u "
++		    "imp_us %llu gl_us %llu flush_us %llu pre_thr_us %lld pre_run_n %lld pre_wait_n %lld still_n %u\n", e->frames, e->prof.cpu0, cpu1,
++		    (long long)elapsed, e->prof.sum_us, e->prof.sum_bytes >> 10, e->prof.sum_n, e->prof.skip_n,
++		    e->attaching, gl_in_calls_us, e->flushing, (long long)e->prof.pre_cpu,
++		    (long long)e->prof.pre_run, (long long)e->prof.pre_wait, e->prof.still_n);
++		e->prof.last_cpu = cpu;
++		e->prof.last_run = prof_run; e->prof.last_wait = prof_wait;
++		e->prof.sum_us = e->prof.sum_bytes = e->prof.sum_n = e->prof.skip_n = e->prof.still_n = 0;
++		import_report();
++	}
+ 	if (frame_lines) {
+ 		/*
+ 		 * One line a frame, for matching with a screen recording (the kernel's rec_ring, whose log
+@@ -1119,9 +2143,10 @@ frame_end(struct eagl *e, bool finished)
+ 	if (e->frames <= 40 || e->frames % 20 == 0) {
+ 		say("redwood-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
+ 		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
+-		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
++		    "out), %llu before it for the IOSurfaces, %llu us inside GL calls\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
+ 		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
+-		    after - waited, e->attaching);
++		    after - waited, e->attaching, gl_in_calls_us);
++		say("redwood-gl: frame %u came %llu us after the one before; %llu us of that inside GL calls\n", e->frames, last_end ? after - last_end : 0, gl_in_calls_us);
+ 	}
+ 	if (e->frames == 30 || e->frames % 200 == 0) {
+ 		summary(e);
+@@ -1130,6 +2155,8 @@ frame_end(struct eagl *e, bool finished)
+ 	if (e->frames == 600 && e->errors == 0) {
+ 		check_errors = 0;
+ 	}
++	last_end = after;
++	gl_in_calls_us = 0;
+ 	e->last_draws = e->draws;
+ 	e->calls = e->draws = e->triangles = e->uploads = e->clears = 0;
+ 	e->upload_bytes = e->attaching = e->flushing = 0;
+@@ -1171,6 +2198,7 @@ drawing(struct eagl *e)
+ 	frame_begin(e);
+ 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+ 		image->drawn = image->painted = true;
++		damage_added(image);
+ 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
+ 			/* the display's picture (a surface of its size): where this frame first draws into it */
+ 			e->line.into_display++;
+@@ -1191,6 +2219,7 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
+ {
+ 	struct eagl *e = context;
+ 	struct image *image;
++	bool seed_changed = false;
+ 
+ 	EAGL_ENTER(e, 0x30);
+ 	if (eagl_tracing) {
+@@ -1201,9 +2230,9 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
+ 		e->bound[e->unit] = texture;
+ 	}
+ 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
+-	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
+-	    image->wrapped && !image->painted && surface_changed(e, image))) {
+-		surface_to_texture(e, image);
++	    (!image->target ? (seed_changed = IOSurfaceGetSeed(image->surface) != image->seed) || surface_changed(e, image, true) :
++	    image->wrapped && !image->painted && surface_changed(e, image, true))) {
++		surface_to_texture(e, image, seed_changed ? IMPORT_SEED : IMPORT_SUM);
+ 	}
+ 	EAGL_LEAVE(e, 0x30);
+ }
+@@ -3184,7 +4213,9 @@ my_glFinish(void *context)
+ 		eagl_trace("glFinish()\n");
+ 	}
+ 	clear_now(e);
++	uint64_t prof_began = fprof_interval ? now_us() : 0;
+ 	glFinish();
++	if (fprof_interval) e->flushing += now_us() - prof_began;
+ 	frame_end(e, true);
+ 	EAGL_LEAVE(e, 0x2d0);
+ }
+@@ -3194,6 +4225,7 @@ my_glFlush(void *context)
+ {
+ 	struct eagl *e = context;
+ 	uint64_t began;
++	unsigned long submits;
+ 
+ 	EAGL_ENTER(e, 0x2d8);
+ 	if (eagl_tracing) {
+@@ -3201,7 +4233,9 @@ my_glFlush(void *context)
+ 	}
+ 	clear_now(e);
+ 	began = now_us();
++	submits = SUBMITS_NOW();
+ 	glFlush();
++	submits_flush += (uint32_t)(SUBMITS_NOW() - submits);
+ 	e->flushing += now_us() - began;
+ 	frame_end(e, false);
+ 	EAGL_LEAVE(e, 0x2d8);
+@@ -3323,6 +4357,16 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
+ 	if (target == GL_TEXTURE_2D && e->unit < 8) {
+ 		group_forget(e, e->bound[e->unit]);
+ 	}
++	if ((ffix & 4) && target == GL_TEXTURE_2D && e->unit < 8) {
++		struct image *image = image_of(e, e->bound[e->unit]);
++		if (image != NULL && image->swizzled) {
++			if (!redwood_gl_surface_swizzle(e->gl, 0)) {
++				EAGL_LEAVE(e, 0x970);
++				return;
++			}
++			image_forget(e, e->bound[e->unit]);
++		}
++	}
+ 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
+ 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+ 	if (began != 0 && now_us() - began >= slow_calls_us) {
+@@ -3830,6 +4874,12 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
+ 		free(e);
+ 		return nil;
+ 	}
++	if (ffix & 4) {
++		int supported = redwood_gl_swizzle_supported(e->gl);
++		const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
++		say("tl: impswzcap supported=%d version=%s ext_texture_swizzle=%u object_test=%d\n", supported,
++		    (const char *)glGetString(GL_VERSION), extensions != NULL && strstr(extensions, "GL_EXT_texture_swizzle") != NULL, supported);
++	}
+ 	current = e;
+ 	e->object = self;
+ 	e->api = api;
+@@ -3933,8 +4983,8 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long
+ 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
+ 	began = now_us();
+ 	if (!surface_shared(e, image)) {
+-		surface_changed(e, image);              /* (what it adds up to now) */
+-		surface_to_texture(e, image);
++		surface_changed(e, image, false);              /* (what it adds up to now) */
++		surface_to_texture(e, image, IMPORT_TEXIMAGE);
+ 	}
+ 	e->attaching += now_us() - began;
+ 	eagl_leave(e, 0x970);
+@@ -3992,9 +5042,19 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
+ 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
+ 	 */
+ 	began = now_us();
+-	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
+-		surface_changed(e, image);              /* (what it adds up to now) */
+-		surface_to_texture(e, image);
++	if (ffix & 8) {
++		if (surface_mirrored(e, image)) {
++			if (!surface_from_mirror(e, image)) {
++				surface_target_fallback(e, image);
++			}
++		} else if (!surface_shared(e, image)) {
++			surface_target_fallback(e, image);
++		}
++	} else {
++		if (surface_mirrored(e, image) || !surface_shared(e, image)) {
++			surface_changed(e, image, false);              /* (what it adds up to now) */
++			surface_to_texture(e, image, IMPORT_ATTACH);
++		}
+ 	}
+ 	e->attaching += now_us() - began;
+ 	if (attached++ < 24) {
+@@ -4075,6 +5135,9 @@ install(void)
+ 
+ 	/* the kernel's boot-args are where a run is told things */
+ 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
++		ffix = ffix_parse(arguments);
++		fprof_interval = fprof_parse(arguments);
++		if (fprof_interval) mach_timebase_info(&fprof_timebase);
+ 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
+ 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
+ 			if (*argument == '-') {
+@@ -4116,6 +5179,12 @@ install(void)
+ 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
+ 		census_on = strstr(arguments, "glcensus=1") != NULL;
+ 		frame_lines = strstr(arguments, "glframes=1") != NULL;
++		drm_calls = dlsym(RTLD_DEFAULT, "redwood_drm_calls");
++		drm_ticks = dlsym(RTLD_DEFAULT, "redwood_drm_ticks");
++		drm_total = dlsym(RTLD_DEFAULT, "redwood_drm_total");
++		if (drm_calls == NULL || drm_ticks == NULL || drm_total == NULL) {
++			drm_calls = drm_ticks = drm_total = NULL;   /* (a library from before: no counts) */
++		}
+ 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
+ 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
+ 			slow_calls_us = strtoull(argument + 7, NULL, 10);
+@@ -4156,6 +5225,8 @@ install(void)
+ 		}
+ 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+ 		blit_targets = strstr(arguments, "glblit=0") == NULL;
++		damage_on = strstr(arguments, "gldamage=0") == NULL;
++		scan_on = strstr(arguments, "glscan=0") == NULL;
+ 		sync_frames = strstr(arguments, "glsync=0") == NULL;
+ 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
+ 			wait_for_frames = 0;
+diff --git a/userland/src/gl_osmesa.c b/userland/src/gl_osmesa.c
+index b7c280c147faeb151dc731626cbc2b32d178f781..272c24a16c98f227c9cdbfa48de3a49795dcb252 100644
+--- a/userland/src/gl_osmesa.c
++++ b/userland/src/gl_osmesa.c
+@@ -35,6 +35,20 @@ extern void OSMesaDestroyContext(OSMesaContext context);
+ extern void (*OSMesaGetProcAddress(const char *name))(void);
+ extern const unsigned char *glGetString(unsigned name);
+ extern unsigned glGetError(void);
++extern void glGetIntegerv(unsigned name, int *value);
++extern void glGenTextures(int n, unsigned *textures);
++extern void glDeleteTextures(int n, const unsigned *textures);
++extern void glBindTexture(unsigned target, unsigned texture);
++extern void glTexParameteri(unsigned target, unsigned name, int value);
++extern void glGetTexParameteriv(unsigned target, unsigned name, int *value);
++#define GL_TEXTURE_BINDING_2D 0x8069
++#define GL_TEXTURE_SWIZZLE_R 0x8e42
++#define GL_RED 0x1903
++#define GL_GREEN 0x1904
++#define GL_BLUE 0x1905
++#define GL_ALPHA 0x1906
++#define GL_VERSION 0x1f02
++#define GL_EXTENSIONS 0x1f03
+ 
+ /*
+  * OSMesa draws its "window" into memory handed to it. Nothing here draws into a window (the
+@@ -44,6 +58,7 @@ extern unsigned glGetError(void);
+ 
+ struct redwood_gl {
+ 	OSMesaContext context;
++	int swizzle_checked, swizzle_supported;
+ 	unsigned char window[WINDOW * WINDOW * 4];
+ };
+ 
+@@ -113,3 +128,64 @@ redwood_gl_surface_texture(struct redwood_gl *gl, uint32_t surface)
+ 	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface);
+ 	return glGetError() == 0;
+ }
++
++static int
++extension_has(const char *list, const char *name)
++{
++	size_t n = strlen(name);
++	if (list == NULL) return 0;
++	for (const char *p = list; (p = strstr(p, name)) != NULL; p += n)
++		if ((p == list || p[-1] == ' ') && (p[n] == 0 || p[n] == ' ')) return 1;
++	return 0;
++}
++
++int
++redwood_gl_surface_swizzle(struct redwood_gl *gl, unsigned kind)
++{
++	static const int channels[3][4] = {
++		{ GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA },
++		{ GL_BLUE, GL_GREEN, GL_RED, GL_ALPHA },
++		{ GL_ALPHA, GL_RED, GL_GREEN, GL_BLUE }
++	};
++	if (kind > 2 || !gl->swizzle_supported) return 0;
++	while (glGetError() != 0) {}
++	for (unsigned i = 0; i < 4; i++)
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R + i, channels[kind][i]);
++	return glGetError() == 0;
++}
++
++int
++redwood_gl_swizzle_supported(struct redwood_gl *gl)
++{
++	if (gl->swizzle_checked) return gl->swizzle_supported;
++	gl->swizzle_checked = 1;
++	const char *version = (const char *)glGetString(GL_VERSION);
++	const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
++	int core = version != NULL && strncmp(version, "OpenGL ES ", 10) == 0 && version[10] >= '3' && version[10] <= '9';
++	if (!core && !extension_has(extensions, "GL_EXT_texture_swizzle") &&
++	    !extension_has(extensions, "GL_ARB_texture_swizzle")) return 0;
++	unsigned textures[2] = { 0, 0 };
++	int bound = 0, good = 1, value = 0;
++	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++	glGenTextures(2, textures);
++	gl->swizzle_supported = 1;
++	glBindTexture(GL_TEXTURE_2D, textures[0]);
++	good &= redwood_gl_surface_swizzle(gl, 1);
++	glBindTexture(GL_TEXTURE_2D, textures[1]);
++	glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, &value);
++	good &= value == GL_RED;
++	glBindTexture(GL_TEXTURE_2D, textures[0]);
++	glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, &value);
++	good &= value == GL_BLUE;
++	good &= redwood_gl_surface_swizzle(gl, 0);
++	for (unsigned i = 0; i < 4; i++) {
++		static const int identity[] = { GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA };
++		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R + i, &value);
++		good &= value == identity[i];
++	}
++	good &= glGetError() == 0 && textures[0] != 0 && textures[1] != 0;
++	glBindTexture(GL_TEXTURE_2D, (unsigned)bound);
++	glDeleteTextures(2, textures);
++	gl->swizzle_supported = good;
++	return good;
++}
+diff --git a/userland/src/init.c b/userland/src/init.c
+index f21bca0250ffc17f3aabf6a66462a8b6c3db6121..d85fb0d012b13c7d3109628b73a89b904202e95b 100644
+--- a/userland/src/init.c
++++ b/userland/src/init.c
+@@ -202,6 +202,15 @@ flash_root(const char *dev)
+ 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
+ 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
+ 	}
++	if (stat(in_image("/etc/bluetool"), &fw_st) == 0) {
++		/*
++		 * BlueTool boots the Bluetooth controller with a Broadcom firmware file it looks for in /etc/bluetool by the
++		 * chip's name (BCM4357B1_...); this phone's chip is a Qualcomm one, and the file here is only a placeholder
++		 * for BlueTool to find and send (the kernel answers what it sends; see bsd/dev/mi8_bt.c).
++		 */
++		check(synthetic_dir("/flash/private/etc/bluetool") && bind_dir(in_image("/etc/bluetool"), "/flash/private/etc/bluetool"),
++		    "the Bluetooth firmware placeholder on /etc/bluetool");
++	}
+ 	if (stat("/jb-bin", &fw_st) == 0) {
+ 		/*
+ 		 * The package manager's prefix is in the boot volume (/jb), and Sileo runs mv, cp, rm, mkdir
+@@ -246,6 +255,21 @@ flash_root(const char *dev)
+ 	printf("  %d applications waiting to be installed, %d of them in /Applications\n", apps, bound);
+ 	check(apps > 0 && bound == apps, "the first boot's applications in /Applications");
+ 
++	if (stat("/apps", &fw_st) == 0) {
++		/*
++		 * Applications from outside, carried in the boot volume (userland/build.sh, ../apps): a union
++		 * mount of them over the volume's /Applications, after the aliases above -- a synthetic entry
++		 * needs its parent to be the volume's own directory. What the volume has stays visible through
++		 * it: lookup falls through to the covered directory, and getdirentries and getattrlistbulk
++		 * go on into it when the top layer is read to its end.
++		 */
++		ok = mount("bindfs", "/flash/Applications", MNT_RDONLY | MNT_UNION, (void *)"/apps") == 0;
++		if (!ok) {
++			printf("  bindfs /apps on /flash/Applications, union: %s\n", strerror(errno));
++		}
++		check(ok, "the boot volume's applications over the volume's /Applications, as a union");
++	}
++
+ 	ok = sysctlbyname("kern.redwood_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
+ 	if (!ok) {
+ 		printf("  switching the root: %s\n", strerror(errno));
+diff --git a/userland/src/inject.c b/userland/src/inject.c
+index c5e9d9020cc05b698313e88984117c43df8d141e..76ebd84c2f5e7db7142633b832b55cceab11cc3b 100644
+--- a/userland/src/inject.c
++++ b/userland/src/inject.c
+@@ -30,6 +30,7 @@
+ #include <dispatch/dispatch.h>
+ #include <dlfcn.h>
+ #include <errno.h>
++#include <math.h>
+ #include <fcntl.h>
+ #include <mach/mach.h>
+ #include <mach/mach_time.h>
+@@ -705,6 +706,89 @@ brightness_fixes(void)
+ 	method_setImplementation(method, (IMP)wait_for_als_arrival);
+ }
+ 
++/* ---- backboardd: the display's brightness -------------------------------------------------------- */
++
++/*
++ * The brightness slider reaches backboardd, which hands the value to CoreBrightness's brightness system
++ * ("[Backlight] Set BrightnessSystem property:DisplayBrightness to:{ Brightness: 0.33, ... }", EXP-0139); with no
++ * display it knows how to drive, it goes no further. Take it there: -[BrightnessSystem setProperty:forKey:] as it is,
++ * and for "DisplayBrightness" the Brightness (0 to 1, the slider's own scale) as the panel's level, 2 to 1023, into
++ * the kernel (sysctl kern.mi8_brightness, which sends the panel DCS 0x51: bsd/dev/mi8_adreno.c). The slider's scale is
++ * perceptual and the panel's roughly linear in light: squared on the way.
++ */
++typedef id (*set_property_t)(id self, SEL selector, id property, id key);
++static set_property_t orig_set_property;
++
++/*
++ * The screen's light is two things in iOS's brightness system: the level the slider sets (DisplayBrightness) and the
++ * factor the lock puts on it (DisplayBrightnessFactor, and ...WithFade: 0 when the phone is locked or dimmed off, 1
++ * otherwise; the fade is not followed). The panel gets the level, or 0 -- display off -- under a factor of 0 (EXP-0142).
++ */
++static float brightness_level = 0.5f, brightness_factor = 1.0f;
++static int brightness_sent = -1;
++
++static void
++brightness_send(void)
++{
++	int level = brightness_factor <= 0 ? 0 : 2 + (int)lroundf(1021.0f * brightness_level * brightness_level);
++
++	if (level != brightness_sent && sysctlbyname("kern.mi8_brightness", NULL, NULL, &level, sizeof(level)) == 0) {
++		brightness_sent = level;
++	} else if (level != brightness_sent) {
++		say("redwood: brightness %.3f x %.3f -> level %d: the kernel did not take it (errno %d)\n", brightness_level,
++		    brightness_factor, level, errno);
++	}
++}
++
++static id
++my_set_property(id self, SEL selector, id property, id key)
++{
++	id result = orig_set_property(self, selector, property, key);
++
++	if (key != NULL && property != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID()) {
++		float number = -1;
++
++		if (CFStringCompare((CFStringRef)key, CFSTR("DisplayBrightness"), 0) == kCFCompareEqualTo &&
++		    CFGetTypeID((CFTypeRef)property) == CFDictionaryGetTypeID()) {
++			CFNumberRef value = CFDictionaryGetValue((CFDictionaryRef)property, CFSTR("Brightness"));
++
++			if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID() &&
++			    CFNumberGetValue(value, kCFNumberFloatType, &number) && number >= 0 && number <= 1) {
++				brightness_level = number;
++				brightness_send();
++			}
++		} else if ((CFStringCompare((CFStringRef)key, CFSTR("DisplayBrightnessFactor"), 0) == kCFCompareEqualTo ||
++		    CFStringCompare((CFStringRef)key, CFSTR("DisplayBrightnessFactorWithFade"), 0) == kCFCompareEqualTo) &&
++		    CFGetTypeID((CFTypeRef)property) == CFNumberGetTypeID() &&
++		    CFNumberGetValue((CFNumberRef)property, kCFNumberFloatType, &number) && number >= 0 && number <= 1) {
++			brightness_factor = number;
++			brightness_send();
++		}
++	}
++	return result;
++}
++
++/* CoreBrightness may not be loaded when this library starts: look again until it is (half a minute at the most). */
++static void
++brightness_bridge(int tries)
++{
++	Class cls = objc_getClass("BrightnessSystem");
++	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("setProperty:forKey:")) : NULL;
++
++	if (method == NULL) {
++		if (tries < 60) {
++			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_global_queue(0, 0), ^{
++				brightness_bridge(tries + 1);
++			});
++		} else {
++			say("redwood: brightness: no -[BrightnessSystem setProperty:forKey:]: the slider stays without effect\n");
++		}
++		return;
++	}
++	orig_set_property = (set_property_t)method_setImplementation(method, (IMP)my_set_property);
++	say("redwood: brightness: the brightness system's display brightness goes to the panel (after %d looks)\n", tries + 1);
++}
++
+ /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
+ 
+ /* IOKit's HID event system, the part that has no public header on iOS (prototypes checked against 20F66) */
+@@ -739,6 +823,7 @@ extern IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uin
+     Boolean down, uint32_t options);
+ extern void IOHIDEventAppendEvent(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
+ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFIndex value);
++extern CFIndex IOHIDEventGetIntegerValue(IOHIDEventRef event, uint32_t field);
+ 
+ #define HID_CLIENT_SIMPLE               4       /* a client that only sends */
+ #define HID_CLIENT_RATE_CONTROLLED      3       /* what IOHIDEventSystemClientCreate() makes */
+@@ -750,6 +835,11 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
+ #define HID_USAGE_MENU                  0x40    /* the home button */
+ #define HID_USAGE_VOLUME_UP             0xe9
+ #define HID_USAGE_VOLUME_DOWN           0xea
++#define HID_PAGE_TELEPHONY              0x0b
++#define HID_USAGE_TFON_RING             0x2e    /* the ringer / silent switch (1 = ring, 0 = silent) */
++#define HID_EVENT_TYPE_KEYBOARD         3
++#define FIELD_KEYBOARD_USAGE_PAGE       0x30000
++#define FIELD_KEYBOARD_USAGE            0x30001
+ #define DIGITIZER_HAND                  3       /* kIOHIDDigitizerTransducerTypeHand */
+ #define DIGITIZER_RANGE                 0x1     /* event mask: what has changed */
+ #define DIGITIZER_TOUCH                 0x2
+@@ -785,6 +875,7 @@ number(int value)
+ /* A service of ours (the callbacks' refcon): what it says of itself, and whether the event server has taken it. */
+ struct service {
+ 	CFMutableDictionaryRef properties;
++	bool has_ringer;
+ 	volatile bool opened;
+ };
+ 
+@@ -864,9 +955,31 @@ service_notification(__unused void *target, __unused void *refcon, __unused IOHI
+ {
+ }
+ 
++static IOHIDEventRef
++service_copy_event(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, uint32_t type,
++    IOHIDEventRef matching, __unused uint32_t options)
++{
++	const struct service *s = refcon;
++	IOHIDEventRef event;
++
++	if (s == NULL || !s->has_ringer || type != HID_EVENT_TYPE_KEYBOARD) {
++		return NULL;
++	}
++	if (matching != NULL &&
++	    (IOHIDEventGetIntegerValue(matching, FIELD_KEYBOARD_USAGE_PAGE) != HID_PAGE_TELEPHONY ||
++	     IOHIDEventGetIntegerValue(matching, FIELD_KEYBOARD_USAGE) != HID_USAGE_TFON_RING)) {
++		return NULL;
++	}
++	event = IOHIDEventCreateKeyboardEvent(NULL, mach_absolute_time(), HID_PAGE_TELEPHONY, HID_USAGE_TFON_RING, true, 0);
++	if (event != NULL) {
++		IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
++	}
++	return event;
++}
++
+ static const struct virtual_service_callbacks service_callbacks = {
+ 	.version = 2, .notification = service_notification, .setProperty = service_set_property,
+-	.copyProperty = service_copy_property,
++	.copyProperty = service_copy_property, .copyEvent = service_copy_event,
+ };
+ 
+ /*
+@@ -895,7 +1008,22 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
+ 
+ 	CFDictionarySetValue(pair, CFSTR("DeviceUsagePage"), page_number);
+ 	CFDictionarySetValue(pair, CFSTR("DeviceUsage"), usage_number);
+-	pairs = CFArrayCreate(NULL, (const void **)&pair, 1, &kCFTypeArrayCallBacks);
++	if (page == HID_PAGE_CONSUMER && usage == HID_USAGE_CONSUMER_CONTROL) {
++		CFMutableDictionaryRef ringer_pair = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
++		    &kCFTypeDictionaryValueCallBacks);
++		CFNumberRef ringer_page = number(HID_PAGE_TELEPHONY), ringer_usage = number(HID_USAGE_TFON_RING);
++		const void *pair_list[2] = { pair, ringer_pair };
++
++		CFDictionarySetValue(ringer_pair, CFSTR("DeviceUsagePage"), ringer_page);
++		CFDictionarySetValue(ringer_pair, CFSTR("DeviceUsage"), ringer_usage);
++		pairs = CFArrayCreate(NULL, pair_list, 2, &kCFTypeArrayCallBacks);
++		made->has_ringer = true;
++		CFRelease(ringer_page);
++		CFRelease(ringer_usage);
++		CFRelease(ringer_pair);
++	} else {
++		pairs = CFArrayCreate(NULL, (const void **)&pair, 1, &kCFTypeArrayCallBacks);
++	}
+ 	CFDictionarySetValue(properties, CFSTR("PrimaryUsagePage"), page_number);
+ 	CFDictionarySetValue(properties, CFSTR("PrimaryUsage"), usage_number);
+ 	CFDictionarySetValue(properties, CFSTR("DeviceUsagePage"), page_number);
+@@ -1067,6 +1195,16 @@ input_thread(__unused void *arg)
+ 	if (screen != NULL) {
+ 		buttons = make_service(client, "Redwood buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
+ 	}
++	if (buttons != NULL) {
++		/* Report the unmuted ringer position once opened (Mi 8 has no hardware mute switch). */
++		IOHIDEventRef ringer = IOHIDEventCreateKeyboardEvent(NULL, mach_absolute_time(), HID_PAGE_TELEPHONY,
++		    HID_USAGE_TFON_RING, true, 0);
++		if (ringer != NULL) {
++			IOHIDEventSetIntegerValue(ringer, FIELD_IS_BUILT_IN, 1);
++			IOHIDVirtualServiceClientDispatchEvent(buttons, ringer);
++			CFRelease(ringer);
++		}
++	}
+ 	say("redwood: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
+ 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
+ 	if (screen == NULL) {
+@@ -1252,6 +1390,7 @@ redwood_init(void)
+ 		}
+ 		opengl_es();
+ 		window_server_fixes();
++		brightness_bridge(0);
+ 		/*
+ 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
+ 		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
+diff --git a/userland/src/inject_bt.c b/userland/src/inject_bt.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..daf4d4bf753bbc8b31da180220c80a87291b1b85
+--- /dev/null
++++ b/userland/src/inject_bt.c
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: MIT */
++/* Copyright (c) 2026 yanei */
++/*
++ * libredwood-bt.dylib: code of ours inside BlueTool and bluetoothd (build.sh, BT=1).
++ *
++ * BlueTool is the program that boots the Bluetooth controller (bluetoothd asks it, over XPC, to run
++ * the "boot" script). It picks that script by the platform and by the maker of the phone's Wi-Fi/
++ * Bluetooth module, which it asks MobileGestalt for (kMGQWifiVendor) and compares with "Murata", "USI"
++ * and the like. This phone's module is neither; MobileGestalt makes BlueTool wait five seconds for
++ * nothing, twice, and then answers "no vendor" (-1), and BlueTool finds no script and gives up.
++ * Here the question is answered "Murata". What the script sends is for a Broadcom controller; the
++ * kernel (iokit/Kernel/RedwoodBT.cpp, bsd/dev/mi8_bt.c) answers what the Qualcomm chip cannot.
++ */
++#include <CoreFoundation/CoreFoundation.h>
++#include <dlfcn.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++extern CFTypeRef MGCopyAnswer(CFStringRef key);
++
++static int ours, told;
++
++static CFTypeRef
++bt_MGCopyAnswer(CFStringRef key)
++{
++	char text[32] = "";
++	CFStringRef *vendor;
++
++	if (ours && key != NULL) {
++		vendor = (CFStringRef *)dlsym(RTLD_DEFAULT, "kMGQWifiVendor");
++		if ((vendor != NULL && *vendor != NULL && CFEqual(key, *vendor)) ||
++		    (CFStringGetCString(key, text, sizeof(text), kCFStringEncodingUTF8) && strcmp(text, "WifiVendor") == 0)) {
++			if (!told++) {
++				dprintf(2, "redwood: bt: the Wi-Fi vendor asked for: answered \"Murata\"\n");
++			}
++			return CFRetain(CFSTR("Murata"));
++		}
++	}
++	return MGCopyAnswer(key);
++}
++
++__attribute__((used)) static struct {
++	const void *ours, *theirs;
++} interposed[] __attribute__((section("__DATA,__interpose"))) = {
++	{ (const void *)bt_MGCopyAnswer, (const void *)MGCopyAnswer },
++};
++
++__attribute__((constructor))
++static void
++redwood_bt_init(void)
++{
++	const char *name = getprogname();
++
++	ours = name != NULL && (strcmp(name, "BlueTool") == 0 || strcmp(name, "bluetoothd") == 0);
++}
+diff --git a/userland/src/inject_sb.c b/userland/src/inject_sb.c
+index 3773115bb3eafe52a3bd0871070b5876fdbdaec6..c5f1e599b0808e6f071df411693d111b770e181d 100644
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -35,7 +35,11 @@
+ #include <IOKit/IOKitLib.h>
+ #include <dispatch/dispatch.h>
+ #include <dlfcn.h>
++#include <arpa/inet.h>
+ #include <fcntl.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <netinet/in.h>
+ #include <mach-o/dyld.h>
+ #include <mach/mach_time.h>
+ #include <notify.h>
+@@ -100,6 +104,200 @@ main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activit
+ 	}
+ }
+ 
++/*
++ * touch_lat=1 (EXP-0158): what SpringBoard is told about the display -- CADisplay's rates (seconds a
++ * frame or frames a second, as CoreAnimation keeps them) and minimum frame duration (in heartbeats),
++ * UIScreen's maximumFramesPerSecond -- to see why its display link ticks every 33.3 ms (U-068).
++ */
++static double
++double_of(id object, const char *name)
++{
++	SEL selector = sel_registerName(name);
++
++	return object && class_getInstanceMethod(object_getClass(object), selector) ?
++	    ((double (*)(id, SEL))objc_msgSend)(object, selector) : -1;
++}
++
++static long
++long_of(id object, const char *name)
++{
++	SEL selector = sel_registerName(name);
++
++	return object && class_getInstanceMethod(object_getClass(object), selector) ?
++	    ((long (*)(id, SEL))objc_msgSend)(object, selector) : -1;
++}
++
++static void
++display_diag(void)
++{
++	Class cadisplay = objc_getClass("CADisplay"), uiscreen = objc_getClass("UIScreen");
++	id display = cadisplay ? ((id (*)(Class, SEL))objc_msgSend)(cadisplay, sel_registerName("mainDisplay")) : nil;
++	id screen = uiscreen ? ((id (*)(Class, SEL))objc_msgSend)(uiscreen, sel_registerName("mainScreen")) : nil;
++
++	say("redwood: display: refreshRate %.6f heartbeatRate %.6f hardwareRefreshRate %.6f minimumFrameDuration %ld "
++	    "preferredFrameDuration %ld latency %.6f; UIScreen maximumFramesPerSecond %ld\n",
++	    double_of(display, "refreshRate"), double_of(display, "heartbeatRate"), double_of(display, "hardwareRefreshRate"),
++	    long_of(display, "minimumFrameDuration"), long_of(display, "preferredFrameDuration"), double_of(display, "latency"),
++	    long_of(screen, "maximumFramesPerSecond"));
++}
++
++/*
++ * touch_lat=1 (EXP-0159): who in SpringBoard asks CADisplayLink for what rate, and what rate its
++ * running display links tick at (every 5 s: those not paused), to find what makes its animations
++ * tick every 33.3 ms (U-068). The caller is named by dladdr() of the return address.
++ */
++typedef struct { float minimum, maximum, preferred; } fps_range;
++static IMP link_add, link_fps, link_interval, link_range;
++static CFTypeRef links[32];
++static int link_count, link_lines;
++static bool link_diag;         /* touch_lat=1: the lines below */
++static bool link_clamp;        /* boot-arg sb_fps_clamp=1: a range whose top is 30 or less is asked for as 60..60 */
++
++static void
++say_caller(const char *what, id link, void *caller, const char *value)
++{
++	Dl_info info = { 0 };
++
++	if (!link_diag || link_lines++ > 300) {
++		return;
++	}
++	dladdr(caller, &info);
++	say("redwood: link %p %s %s from %s +%#lx\n", (void *)link, what, value,
++	    info.dli_fname ? strrchr(info.dli_fname, '/') + 1 : "?",
++	    info.dli_fbase ? (unsigned long)((char *)caller - (char *)info.dli_fbase) : 0ul);
++}
++
++static void
++hooked_link_add(id self, SEL _cmd, id loop, id mode)
++{
++	if (link_count < 32) {
++		links[link_count++] = CFRetain((CFTypeRef)self);
++	}
++	say_caller("added", self, __builtin_return_address(0), "");
++	((void (*)(id, SEL, id, id))link_add)(self, _cmd, loop, mode);
++}
++
++static void
++hooked_link_fps(id self, SEL _cmd, long fps)
++{
++	char value[32];
++
++	snprintf(value, sizeof(value), "%ld", fps);
++	say_caller("preferredFramesPerSecond", self, __builtin_return_address(0), value);
++	((void (*)(id, SEL, long))link_fps)(self, _cmd, fps);
++}
++
++static void
++hooked_link_interval(id self, SEL _cmd, long interval)
++{
++	char value[32];
++
++	snprintf(value, sizeof(value), "%ld", interval);
++	say_caller("frameInterval", self, __builtin_return_address(0), value);
++	((void (*)(id, SEL, long))link_interval)(self, _cmd, interval);
++}
++
++static void
++hooked_link_range(id self, SEL _cmd, fps_range range)
++{
++	char value[64];
++
++	snprintf(value, sizeof(value), "%.0f..%.0f pref %.0f", range.minimum, range.maximum, range.preferred);
++	say_caller("preferredFrameRateRange", self, __builtin_return_address(0), value);
++	if (link_clamp && range.maximum > 0 && range.maximum <= 30) {
++		range.minimum = range.maximum = range.preferred = 60;
++	}
++	((void (*)(id, SEL, fps_range))link_range)(self, _cmd, range);
++}
++
++static IMP
++hook_link(const char *selector, IMP replacement)
++{
++	Method method = class_getInstanceMethod(objc_getClass("CADisplayLink"), sel_registerName(selector));
++
++	return method ? method_setImplementation(method, replacement) : NULL;
++}
++
++static void
++dump_links(void)
++{
++	static int thermal_lines;
++
++	if (thermal_lines++ < 3) {
++		id info = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("NSProcessInfo"), sel_registerName("processInfo"));
++
++		say("redwood: SpringBoard: thermalState %ld lowPowerMode %ld\n", long_of(info, "thermalState"),
++		    long_of(info, "isLowPowerModeEnabled") & 0xff);
++	}
++	for (int i = 0; i < link_count && link_lines < 600; i++) {
++		id link = (id)links[i];
++		SEL range_selector = sel_registerName("preferredFrameRateRange");
++		fps_range range = { -1, -1, -1 };
++		double timestamp = double_of(link, "timestamp"), target = double_of(link, "targetTimestamp");
++
++		if (((BOOL (*)(id, SEL))objc_msgSend)(link, sel_registerName("isPaused"))) {
++			continue;
++		}
++		if (class_getInstanceMethod(object_getClass(link), range_selector)) {
++			range = ((fps_range (*)(id, SEL))objc_msgSend)(link, range_selector);
++		}
++		link_lines++;
++		say("redwood: link %p running: preferredFramesPerSecond %ld frameInterval %ld range %.0f..%.0f pref %.0f "
++		    "duration %.4f target-timestamp %.4f\n", (void *)link, long_of(link, "preferredFramesPerSecond"),
++		    long_of(link, "frameInterval"), range.minimum, range.maximum, range.preferred, double_of(link, "duration"),
++		    target - timestamp);
++	}
++}
++
++/* boot-arg sb_fps_clamp=1, with or without touch_lat=1 (EXP-0160) */
++static void
++fps_clamp_install(void)
++{
++	char args[1024] = "";
++	size_t size = sizeof(args) - 1;
++
++	link_clamp = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "sb_fps_clamp=1") != NULL;
++	if (link_clamp && link_range == NULL) {
++		link_range = hook_link("setPreferredFrameRateRange:", (IMP)hooked_link_range);
++	}
++	say("redwood: SpringBoard: display links asking for 30 fps or less get 60: %s\n",
++	    !link_clamp ? "no" : link_range ? "yes" : "no (no such method)");
++}
++
++static void
++watch_display_links(void)
++{
++	{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		id info = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("NSProcessInfo"), sel_registerName("processInfo"));
++
++		(void)args;
++		(void)size;
++		link_diag = true;
++		say("redwood: SpringBoard: thermalState %ld lowPowerMode %ld; fps clamp %d\n", long_of(info, "thermalState"),
++		    long_of(info, "isLowPowerModeEnabled"), link_clamp);
++	}
++	link_add = hook_link("addToRunLoop:forMode:", (IMP)hooked_link_add);
++	link_fps = hook_link("setPreferredFramesPerSecond:", (IMP)hooked_link_fps);
++	link_interval = hook_link("setFrameInterval:", (IMP)hooked_link_interval);
++	if (link_range == NULL) {
++		link_range = hook_link("setPreferredFrameRateRange:", (IMP)hooked_link_range);
++	}
++	say("redwood: link hooks: add %p fps %p interval %p range %p\n", (void *)link_add, (void *)link_fps,
++	    (void *)link_interval, (void *)link_range);
++	{
++		dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
++
++		dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC,
++		    NSEC_PER_SEC / 10);
++		dispatch_source_set_event_handler(timer, ^{
++			dump_links();
++		});
++		dispatch_resume(timer);
++	}
++}
++
+ static void
+ watch_main_loop(void)
+ {
+@@ -112,6 +310,11 @@ watch_main_loop(void)
+ 		return;
+ 	}
+ 	mach_timebase_info(&timebase);
++	display_diag();
++	watch_display_links();
++	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++		display_diag();
++	});
+ 	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, LONG_MIN,
+ 	    main_loop_turn, NULL), kCFRunLoopCommonModes);
+ 	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true, CA_COMMIT_ORDER - 1,
+@@ -670,11 +873,17 @@ prewarm_orb_view_shaders(id self, SEL selector)
+  * notifier runs once per image already loaded and once per image afterwards, and the first time the
+  * class is there the replacement goes in.
+  */
++static bool torch_installed;
++static void flashlight_install(void);
++
+ static void
+ image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
+ {
+ 	static bool told;
+ 
++	if (!torch_installed) {
++		flashlight_install();
++	}
+ 	if (original_prewarm_orb_view_shaders != NULL || objc_getClass("SiriPresentationViewController") == NULL) {
+ 		return;
+ 	}
+@@ -1050,6 +1259,255 @@ control_center_fades(const char *arguments)
+ 	method_setImplementation(add, (IMP)add_animation_cc);
+ }
+ 
++
++/*
++ * Control Center's sliders (EXP-0140/0141): their views are made with user interaction off, so a drag on one went to Control Center itself; turned on here when a touch lands next to one (ccslider=0: not). Boot-arg ccdiag=1 (EXP-0140): why the brightness slider in Control Center can't be dragged. Writes down, for
++ * touches that land in the Control Center window, the view that is hit (with its superviews, their
++ * userInteractionEnabled and gesture recognizers), and the state changes of the gesture recognizers whose view is in
++ * that window. Only looks.
++ */
++struct diag_point { double x, y; };
++static id (*original_diag_hit_test)(id self, SEL selector, struct diag_point point, id event);
++static void (*original_diag_set_state)(id self, SEL selector, long state);
++static unsigned diag_hits, diag_states, diag_trees;
++static bool diag_fix, diag_log;
++struct diag_rect { double x, y, w, h; };
++
++/* the views under `view`: class, frame, hidden, alpha, interaction (what the slider is made of, and where) */
++static void
++diag_tree(id view, int depth)
++{
++	struct diag_rect frame = ((struct diag_rect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
++	id subviews = SEND(id, view, "subviews");
++	unsigned long count = subviews ? SEND(unsigned long, subviews, "count") : 0;
++
++	say("redwood: ccdiag:   tree %*s%s (%.0f,%.0f %.0fx%.0f)%s alpha %.2f interaction %d clips %d subviews %lu\n", 2 * depth, "",
++	    object_getClassName(view), frame.x, frame.y, frame.w, frame.h, SEND(BOOL, view, "isHidden") ? " hidden" : "",
++	    SEND(double, view, "alpha"), SEND(BOOL, view, "isUserInteractionEnabled"), SEND(BOOL, view, "clipsToBounds"), count);
++	for (unsigned long i = 0; depth < 5 && i < count && i < 10; i++) {
++		diag_tree(SEND1(id, subviews, "objectAtIndex:", unsigned long, i), depth + 1);
++	}
++}
++
++static bool
++diag_window_is_cc(id window)
++{
++	return window != NULL && strstr(object_getClassName(window), "ControlCenter") != NULL;
++}
++
++static id
++diag_hit_test(id self, SEL selector, struct diag_point point, id event)
++{
++	id hit = original_diag_hit_test(self, selector, point, event);
++
++	/* the sliders' views are made with user interaction off (EXP-0140, boot-arg ccslider=0 leaves them so), so touches stop at their module's
++	 * container and the slider's own gesture recognizer never sees them: turn it on, and look again */
++	if (diag_fix && hit != NULL && diag_window_is_cc(self) && strcmp(object_getClassName(hit), "CCUIContentModuleContentContainerView") == 0) {
++		id subviews = SEND(id, hit, "subviews");
++		unsigned long count = subviews ? SEND(unsigned long, subviews, "count") : 0;
++		bool changed = false;
++
++		for (unsigned long i = 0; i < count; i++) {
++			id sub = SEND1(id, subviews, "objectAtIndex:", unsigned long, i);
++
++			if (strstr(object_getClassName(sub), "SliderView") != NULL && !SEND(BOOL, sub, "isUserInteractionEnabled")) {
++				SEND1(void, sub, "setUserInteractionEnabled:", BOOL, YES);
++				changed = true;
++				say("redwood: ccdiag: %s: user interaction turned on\n", object_getClassName(sub));
++			}
++		}
++		if (changed) {
++			hit = original_diag_hit_test(self, selector, point, event);
++		}
++	}
++	if (diag_log && hit != NULL && diag_window_is_cc(self) && diag_hits < 60) {
++		diag_hits++;
++		say("redwood: ccdiag: hit (%.0f,%.0f) in %s:\n", point.x, point.y, object_getClassName(self));
++		id view = hit;
++
++		for (int depth = 0; view != NULL && depth < 12; depth++, view = SEND(id, view, "superview")) {
++			id recognizers = SEND(id, view, "gestureRecognizers");
++			unsigned long count = recognizers ? SEND(unsigned long, recognizers, "count") : 0;
++			char kinds[200] = "";
++
++			for (unsigned long i = 0; i < count && i < 6; i++) {
++				id recognizer = SEND1(id, recognizers, "objectAtIndex:", unsigned long, i);
++
++				snprintf(kinds + strlen(kinds), sizeof(kinds) - strlen(kinds), " %s%s", object_getClassName(recognizer),
++				    SEND(BOOL, recognizer, "isEnabled") ? "" : "(off)");
++			}
++			say("redwood: ccdiag:   %*s%s interaction %d%s%s\n", depth, "", object_getClassName(view),
++			    SEND(BOOL, view, "isUserInteractionEnabled"), count ? " recognizers:" : "", kinds);
++		}
++		if (diag_trees < 6 && strcmp(object_getClassName(hit), "CCUIContentModuleContentContainerView") == 0) {
++			diag_trees++;
++			diag_tree(hit, 0);
++		}
++	}
++	return hit;
++}
++
++static void
++diag_set_state(id self, SEL selector, long state)
++{
++	id view = SEND(id, self, "view");
++	id window = view ? SEND(id, view, "window") : NULL;
++
++	if (diag_log && diag_window_is_cc(window) && diag_states < 200) {
++		diag_states++;
++		say("redwood: ccdiag: %s (on %s) state -> %ld\n", object_getClassName(self), object_getClassName(view), state);
++	}
++	original_diag_set_state(self, selector, state);
++}
++
++static void
++control_center_diag(const char *arguments)
++{
++	Class window = objc_getClass("UIWindow"), recognizer = objc_getClass("UIGestureRecognizer");
++	SEL hit = sel_registerName("hitTest:withEvent:"), set_state = sel_registerName("setState:");
++	Method hit_method = window ? class_getInstanceMethod(window, hit) : NULL;
++	Method state_method = recognizer ? class_getInstanceMethod(recognizer, set_state) : NULL;
++
++	diag_log = strstr(arguments, "ccdiag=1") != NULL;
++	diag_fix = strstr(arguments, "ccslider=0") == NULL;
++	if ((!diag_log && !diag_fix) || hit_method == NULL || state_method == NULL) {
++		return;
++	}
++	original_diag_hit_test = (id (*)(id, SEL, struct diag_point, id))method_getImplementation(hit_method);
++	class_replaceMethod(window, hit, (IMP)diag_hit_test, method_getTypeEncoding(hit_method));
++	original_diag_set_state = (void (*)(id, SEL, long))method_getImplementation(state_method);
++	method_setImplementation(state_method, (IMP)diag_set_state);
++	say("redwood: Control Center: sliders %s%s\n", diag_fix ? "made to take touches" : "left alone", diag_log ? ", hit views and gesture states written down (ccdiag=1)" : "");
++}
++
++/*
++ * The flashlight (EXP-0144): Control Center's button and the lock screen's reach AVFlashlight, which asks mediaserverd's
++ * FigFlashlight -- and there is no mediaserverd here. So in SpringBoard AVFlashlight is given the kernel's light instead
++ * (/dev/redwood-torch, boot-arg torch=3, bsd/dev/redwood_torch.c: 0 to 1000 thousandths of the phone's torch current, the
++ * kernel's own limits on time and temperature apply). Where the device is not there, nothing is changed. Every call is
++ * said (the first so many), since which of AVFlashlight's methods the button uses is not known.
++ */
++static int torch_fd = -1;
++static float torch_level = 1.0f;                        /* what turnPowerOn lights; set by setFlashlightLevel: */
++static bool torch_lit, torch_installed;
++static unsigned torch_told;
++
++static void
++torch_send(uint32_t thousandths)
++{
++	ssize_t n;
++
++	if (torch_fd < 0 && (torch_fd = open("/dev/redwood-torch", O_WRONLY)) < 0) {
++		say("redwood: flashlight: /dev/redwood-torch cannot be opened (%d)\n", errno);
++		return;
++	}
++	n = write(torch_fd, &thousandths, sizeof(thousandths));
++	if (torch_told++ < 60 || n != (ssize_t)sizeof(thousandths)) {
++		say("redwood: flashlight: %u of 1000 asked of the kernel%s\n", thousandths, n == (ssize_t)sizeof(thousandths) ? "" : " (NOT TAKEN)");
++	}
++}
++
++static id
++flashlight_init(id self, __unused SEL selector)
++{
++	if (torch_told++ < 60) {
++		say("redwood: flashlight: -[AVFlashlight init]\n");
++	}
++	return self;
++}
++
++static BOOL
++flashlight_yes(__unused id self, __unused SEL selector)
++{
++	return YES;
++}
++
++static BOOL
++flashlight_no(__unused id self, __unused SEL selector)
++{
++	return NO;
++}
++
++static float
++flashlight_get_level(__unused id self, __unused SEL selector)
++{
++	return torch_lit ? torch_level : 0.0f;
++}
++
++static BOOL
++flashlight_set_level(id self, __unused SEL selector, float level, __unused id *error)
++{
++	level = level < 0.0f ? 0.0f : level > 1.0f ? 1.0f : level;
++	SEND1(void, self, "willChangeValueForKey:", id, (id)CFSTR("flashlightLevel"));
++	if (level > 0.0f) {
++		torch_level = level;
++	}
++	torch_lit = level > 0.0f;
++	torch_send((uint32_t)(level * 1000.0f + 0.5f));
++	SEND1(void, self, "didChangeValueForKey:", id, (id)CFSTR("flashlightLevel"));
++	return YES;
++}
++
++static BOOL
++flashlight_power_on(id self, __unused SEL selector, __unused id *error)
++{
++	SEND1(void, self, "willChangeValueForKey:", id, (id)CFSTR("flashlightLevel"));
++	torch_lit = true;
++	torch_send((uint32_t)(torch_level * 1000.0f + 0.5f));
++	SEND1(void, self, "didChangeValueForKey:", id, (id)CFSTR("flashlightLevel"));
++	return YES;
++}
++
++static void
++flashlight_power_off(id self, __unused SEL selector)
++{
++	SEND1(void, self, "willChangeValueForKey:", id, (id)CFSTR("flashlightLevel"));
++	torch_lit = false;
++	torch_send(0);
++	SEND1(void, self, "didChangeValueForKey:", id, (id)CFSTR("flashlightLevel"));
++}
++
++/* Once AVFlashlight is there (its framework may come late, with the Control Center module), and the kernel has the light. */
++static void
++flashlight_install(void)
++{
++	static const struct { const char *selector; IMP implementation; } methods[] = {
++		{ "init", (IMP)flashlight_init },
++		{ "isAvailable", (IMP)flashlight_yes },
++		{ "isOverheated", (IMP)flashlight_no },
++		{ "flashlightLevel", (IMP)flashlight_get_level },
++		{ "setFlashlightLevel:withError:", (IMP)flashlight_set_level },
++		{ "turnPowerOnWithError:", (IMP)flashlight_power_on },
++		{ "turnPowerOff", (IMP)flashlight_power_off },
++	};
++	Class cls;
++	unsigned count = 0;
++	Method *list;
++
++	if (torch_installed || (cls = objc_getClass("AVFlashlight")) == NULL) {
++		return;
++	}
++	if (access("/dev/redwood-torch", W_OK) != 0) {
++		return;                 /* (no torch=3 in this run: AVFlashlight stays what it is; looked at again when another image comes) */
++	}
++	torch_installed = true;
++	list = class_copyMethodList(cls, &count);
++	for (unsigned i = 0; i < count; i++) {
++		say("redwood: flashlight: -[AVFlashlight %s]\n", sel_getName(method_getName(list[i])));
++	}
++	free(list);
++	for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
++		Method method = class_getInstanceMethod(cls, sel_registerName(methods[i].selector));
++
++		if (method != NULL) {
++			method_setImplementation(method, methods[i].implementation);
++		} else {
++			say("redwood: flashlight: AVFlashlight has no %s\n", methods[i].selector);
++		}
++	}
++	say("redwood: flashlight: AVFlashlight is the kernel's light (/dev/redwood-torch)\n");
++}
++
+ /*
+  * Open the tweak loader of the package manager's prefix, when there is one. Nothing here depends on
+  * it: without a prefix (or without ElleKit in it) the file is not there and this does nothing.
+@@ -1071,6 +1529,200 @@ load_tweaks(void)
+ 	}
+ }
+ 
++/*
++ * The status bar at a screen UIKit has no layout for (fbscale=2: the iPhone X's 375 x 812 points at two pixels a point). UIKit asks
++ * which "visual provider" draws the bar on this screen, finds none and puts up its fallback, a red bar that says "rdar:45025538". The
++ * fallback is made the iPhone X's provider: the class methods of the split provider are copied onto the fallback's metaclass, and
++ * the fallback's alloc makes an instance of the split class. (Replacing the answer of +visualProviderSubclassForScreen:... alone does
++ * not do it: the fallback is made on another path too.)
++ */
++static void
++status_bar_fallback_hook(void)
++{
++	static int tries;
++	static Class split_class;
++	Class fallback = objc_getClass("_UIStatusBarVisualProvider_Fallback");
++	Class split = objc_getClass("_UIStatusBarVisualProvider_Split1125");
++
++	if (fallback == NULL || split == NULL) {
++		if (tries++ < 6) {
++			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++				status_bar_fallback_hook();
++			});
++			return;
++		}
++		unsigned count = 0;
++		Class *all = objc_copyClassList(&count);
++
++		say("redwood: status bar: no %s: the provider classes are:", fallback == NULL ? "fallback provider" : "split provider 1125");
++		for (unsigned i = 0; i < count; i++) {
++			const char *name = class_getName(all[i]);
++
++			if (strncmp(name, "_UIStatusBarVisualProvider", 26) == 0) {
++				say(" %s", name);
++			}
++		}
++		say("\n");
++		free(all);
++		return;
++	}
++	split_class = split;
++
++	/* the classes between the split provider and what it has in common with the fallback, base first so that the derived one wins */
++	Class chain[8];
++	unsigned depth = 0, copied = 0;
++
++	for (Class c = split; c != NULL && depth < 8; c = class_getSuperclass(c)) {
++		bool shared = false;
++
++		for (Class f = fallback; f != NULL; f = class_getSuperclass(f)) {
++			if (f == c) {
++				shared = true;
++				break;
++			}
++		}
++		if (shared) {
++			break;
++		}
++		chain[depth++] = c;
++	}
++	Class meta = object_getClass(fallback);
++
++	for (unsigned i = depth; i > 0; i--) {
++		unsigned count = 0;
++		Method *methods = class_copyMethodList(object_getClass(chain[i - 1]), &count);
++
++		for (unsigned m = 0; m < count; m++) {
++			const char *name = sel_getName(method_getName(methods[m]));
++
++			if (strcmp(name, "load") == 0 || strcmp(name, "initialize") == 0 || strcmp(name, "alloc") == 0 ||
++			    strcmp(name, "allocWithZone:") == 0) {
++				continue;
++			}
++			class_replaceMethod(meta, method_getName(methods[m]), method_getImplementation(methods[m]),
++			    method_getTypeEncoding(methods[m]));
++			copied++;
++		}
++		free(methods);
++	}
++	class_replaceMethod(meta, sel_registerName("alloc"), imp_implementationWithBlock((id)^id(__unused id self) {
++		return ((id (*)(Class, SEL))objc_msgSend)(split_class, sel_registerName("alloc"));
++	}), "@16@0:8");
++	class_replaceMethod(meta, sel_registerName("allocWithZone:"), imp_implementationWithBlock((id)^id(__unused id self, void *zone) {
++		return ((id (*)(Class, SEL, void *))objc_msgSend)(split_class, sel_registerName("allocWithZone:"), zone);
++	}), "@24@0:8^{_NSZone=}16");
++	say("redwood: status bar: the fallback provider is %s from now on (%u class methods, %u class(es) of it)\n", class_getName(split),
++	    copied, depth);
++}
++
++/*
++ * A still wallpaper where the live one is not drawn (fbscale=2: UIKit has no screen class for the display, and PosterBoard draws
++ * nothing on it, so the wallpaper window shows its own black). A picture (/redwood/etc/wallpaper.jpg) or, without one, a gradient is put over everything the window holds (it is black there). On a screen UIKit
++ * knows the poster covers it, so the layer is only added with fbscale, or with still_wall=1 for a still wallpaper at the full size (kern.bootargs).
++ */
++#define WALLPAPER_PICTURE "/redwood/etc/wallpaper.jpg"
++
++struct wall_point {
++	double x, y;
++};
++struct wall_rect {
++	double x, y, w, h;
++};
++
++static void
++wallpaper_still_hook(void)
++{
++	static int tries;
++	static bool done;
++	char args[1024] = "";
++	size_t size = sizeof(args) - 1;
++	const char *arg;
++
++	if (done) {
++		return;
++	}
++	/* fbscale=N with N other than 0 and 3 (3 is the iPhone X's own), or still_wall=1 on the screen the model has */
++	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
++		return;
++	}
++	arg = strstr(args, "fbscale=");
++	bool scaled = arg != NULL && (arg == args || arg[-1] == ' ') && arg[8] != '0' && arg[8] != '3' && arg[8] != ' ' && arg[8] != '\0';
++
++	arg = strstr(args, "still_wall=");
++	bool still = arg != NULL && (arg == args || arg[-1] == ' ') && arg[11] == '1' && (arg[12] == ' ' || arg[12] == '\0');
++	if (!scaled && !still) {
++		return;
++	}
++	Class window_class = objc_getClass("_SBWallpaperSecureWindow"), application = objc_getClass("UIApplication");
++	id app = application ? SEND(id, application, "sharedApplication") : NULL;
++	id windows = app ? SEND(id, app, "windows") : NULL;
++	unsigned long count = windows ? SEND(unsigned long, windows, "count") : 0;
++
++	for (unsigned long i = 0; window_class != NULL && i < count; i++) {
++		id window = SEND1(id, windows, "objectAtIndex:", unsigned long, i);
++
++		if (!SEND1(bool, window, "isKindOfClass:", Class, window_class)) {
++			continue;
++		}
++		id layer = SEND(id, window, "layer");
++		Class gradient_class = objc_getClass("CAGradientLayer"), plain_class = objc_getClass("CALayer");
++		void *(*color_create)(double, double, double, double) = dlsym(RTLD_DEFAULT, "CGColorCreateGenericRGB");
++		void *(*source_create)(CFURLRef, CFDictionaryRef) = dlsym(RTLD_DEFAULT, "CGImageSourceCreateWithURL");
++		void *(*image_create)(void *, size_t, CFDictionaryRef) = dlsym(RTLD_DEFAULT, "CGImageSourceCreateImageAtIndex");
++
++		if (layer == NULL || gradient_class == NULL || plain_class == NULL || color_create == NULL) {
++			break;
++		}
++		struct wall_rect bounds = ((struct wall_rect (*)(id, SEL))objc_msgSend)(layer, sel_registerName("bounds"));
++		id still = NULL;
++		void *picture = NULL;
++
++		/* a picture, if there is one at WALLPAPER_PICTURE (jpeg or png): drawn to fill the screen */
++		if (source_create != NULL && image_create != NULL) {
++			CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)WALLPAPER_PICTURE, strlen(WALLPAPER_PICTURE), false);
++			void *source = url ? source_create(url, NULL) : NULL;
++
++			picture = source ? image_create(source, 0, NULL) : NULL;
++			if (source) {
++				CFRelease(source);
++			}
++			if (url) {
++				CFRelease(url);
++			}
++		}
++		if (picture != NULL) {
++			still = SEND(id, SEND(id, (id)plain_class, "alloc"), "init");
++			SEND1(void, still, "setContents:", void *, picture);
++			SEND1(void, still, "setContentsGravity:", CFStringRef, CFSTR("resizeAspectFill"));
++			SEND1(void, still, "setMasksToBounds:", bool, true);
++		} else {
++			still = SEND(id, SEND(id, (id)gradient_class, "alloc"), "init");
++			const void *colors[3] = { color_create(0.10, 0.17, 0.42, 1.0), color_create(0.30, 0.20, 0.56, 1.0),
++				                  color_create(0.62, 0.30, 0.52, 1.0) };
++			CFArrayRef list = CFArrayCreate(NULL, colors, 3, &kCFTypeArrayCallBacks);
++
++			((void (*)(id, SEL, struct wall_point))objc_msgSend)(still, sel_registerName("setStartPoint:"), (struct wall_point){ 0.5, 0.0 });
++			((void (*)(id, SEL, struct wall_point))objc_msgSend)(still, sel_registerName("setEndPoint:"), (struct wall_point){ 0.5, 1.0 });
++			SEND1(void, still, "setColors:", CFArrayRef, list);
++			CFRelease(list);
++		}
++		((void (*)(id, SEL, struct wall_rect))objc_msgSend)(still, sel_registerName("setFrame:"), bounds);
++		SEND1(void, still, "setOpaque:", bool, true);
++		/* on top: what the window holds below it is its own black, and nothing is drawn above it where there is no poster */
++		SEND1(void, layer, "addSublayer:", id, still);
++		done = true;
++		say("redwood: wallpaper: a still %s is over the wallpaper window (%.0f x %.0f)\n", picture ? "picture" : "gradient", bounds.w, bounds.h);
++		return;
++	}
++	if (tries++ < 90) {
++		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++			wallpaper_still_hook();
++		});
++	} else {
++		say("redwood: wallpaper: no wallpaper window to put a still picture under\n");
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ redwood_springboard_init(void)
+@@ -1097,6 +1749,8 @@ redwood_springboard_init(void)
+ 		});
+ 		return;
+ 	}
++	status_bar_fallback_hook();
++	wallpaper_still_hook();
+ 	/*
+ 	 * The tweaks of the package manager's prefix, if one is installed: ElleKit's loader
+ 	 * (/var/jb/usr/lib/TweakLoader.dylib) reads /var/jb/usr/lib/TweakInject and opens the tweaks
+@@ -1196,6 +1850,7 @@ redwood_springboard_init(void)
+ 		if (device && class_getInstanceMethod(object_getClass(device), monitoring)) {
+ 			((void (*)(id, SEL, BOOL))objc_msgSend)(device, monitoring, YES);
+ 		}
++		fps_clamp_install();
+ 		watch_main_loop();
+ 		{
+ 			char arguments[1024] = "";
+@@ -1203,6 +1858,8 @@ redwood_springboard_init(void)
+ 
+ 			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+ 				control_center_fades(arguments);
++				control_center_diag(arguments);
++				flashlight_install();
+ 			}
+ 		}
+ 		say("redwood: battery: SOC=%d%% battery=%d charger=%d charging=%d\n",
+diff --git a/userland/src/net_test.m b/userland/src/net_test.m
+index a40787c16224e73da3967cf40392e36c6a3f998b..2f7e8bb425d4ac15fca10da5e851f954537d0273 100644
+--- a/userland/src/net_test.m
++++ b/userland/src/net_test.m
+@@ -50,12 +50,20 @@
+ #include <errno.h>
+ #include <ifaddrs.h>
+ #include <mach/mach.h>
++#include <mach/task.h>
++#include <mach/thread_act.h>
+ #include <sys/sysctl.h>
+ #include <mach/mach_time.h>
+ #include <net/if.h>
+ #include <net/if_dl.h>
+ #include <netdb.h>
+ #include <netinet/in.h>
++#include <Network/Network.h>
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/ioctl.h>
++#include <sys/socket.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -63,6 +71,22 @@
+ #include <sys/socket.h>
+ #include <unistd.h>
+ 
++/* (sys/kern_event.h and sys/sys_domain.h are not in the iOS SDK) */
++#ifndef SYSPROTO_EVENT
++#define SYSPROTO_EVENT 1
++#endif
++#define KEV_VENDOR_APPLE 1
++#define KEV_ANY_SUBCLASS 0
++struct kev_request {
++	uint32_t vendor_code, kev_class, kev_subclass;
++};
++struct kern_event_msg {
++	uint32_t total_size, vendor_code, kev_class, kev_subclass, id, event_code;
++	uint32_t event_data[1];
++};
++#define SIOCSKEVFILT _IOW('e', 2, struct kev_request)
++
++
+ /* not in the iOS SDK's headers, in the libraries all the same */
+ extern mach_port_t bootstrap_port;
+ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap, const char *name, mach_port_t *service);
+@@ -391,11 +415,13 @@ wifi(void)
+ 	}
+ 	for (const char *word = strtok(arguments, " "); word != NULL; word = strtok(NULL, " ")) {
+ 		wanted |= strcmp(word, "wifi=1") == 0;
++		/* Mi 8 (WCN3990 under ath10k): the radio is mi8_rproc.c's, after the modem, about 160 s in */
++		wanted |= strncmp(word, "wifi_lx=", 8) == 0 && strcmp(word + 8, "0") != 0;
+ 	}
+ 	if (!wanted) {
+ 		return;
+ 	}
+-	while (!(there = if_nametoindex("en0") != 0) && seconds() - start < 120) {
++	while (!(there = if_nametoindex("en0") != 0) && seconds() - start < 300) {
+ 		usleep(500000);
+ 	}
+ 	if (!there) {
+@@ -429,6 +455,327 @@ wifi(void)
+ 	dhcp("en0");
+ }
+ 
++/* ---- path ------------------------------------------------------------------------------------------- */
++
++/*
++ * What an application is told about the network: Network.framework's path (what NWPathMonitor shows Music,
++ * Safari and the status bar's data). EXP-0226: Music says "You are offline" with Wi-Fi joined and DHCP done.
++ */
++static void
++path_look(double seconds)
++{
++	dispatch_queue_t queue = dispatch_queue_create("net_test.path", DISPATCH_QUEUE_SERIAL);
++	nw_path_monitor_t monitor = nw_path_monitor_create();
++
++	nw_path_monitor_set_queue(monitor, queue);
++	nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
++		nw_path_status_t status = nw_path_get_status(path);
++		NSMutableString *interfaces = [NSMutableString string];
++
++		nw_path_enumerate_interfaces(path, ^bool (nw_interface_t interface) {
++			[interfaces appendFormat:@" %s(type %d)", nw_interface_get_name(interface), (int)nw_interface_get_type(interface)];
++			return true;
++		});
++		printf("net_test: path: status %d (1 satisfied, 2 unsatisfied, 3 satisfiable); wifi %d cellular %d wired %d; ipv4 %d ipv6 %d dns %d; "
++		    "expensive %d constrained %d; interfaces:%s\n", (int)status, nw_path_uses_interface_type(path, nw_interface_type_wifi),
++		    nw_path_uses_interface_type(path, nw_interface_type_cellular), nw_path_uses_interface_type(path, nw_interface_type_wired),
++		    nw_path_has_ipv4(path), nw_path_has_ipv6(path), nw_path_has_dns(path), nw_path_is_expensive(path),
++		    nw_path_is_constrained(path), interfaces.UTF8String);
++	});
++	nw_path_monitor_start(monitor);
++	usleep((useconds_t)(seconds * 1e6));
++	nw_path_monitor_cancel(monitor);
++}
++
++/* ---- kev ----------------------------------------------------------------------------------------------- */
++
++/*
++ * EXP-0230: listen the way IO80211.framework does (a PF_SYSTEM kernel-event socket, class 6 = IEEE 802.11), and
++ * count the events by number for some seconds: do the link-quality events (39) reach user space?
++ */
++static void
++kev_look(double length)
++{
++	int fd = socket(PF_SYSTEM, SOCK_RAW, SYSPROTO_EVENT);
++	struct kev_request request = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = 6, .kev_subclass = KEV_ANY_SUBCLASS };
++	unsigned counts[256] = { 0 }, sizes[256] = { 0 };
++	double start = seconds();
++	char buffer[4096];
++
++	if (fd < 0 || ioctl(fd, SIOCSKEVFILT, &request) != 0) {
++		printf("net_test: kev: no socket (%d)\n", errno);
++		return;
++	}
++	fcntl(fd, F_SETFL, O_NONBLOCK);
++	while (seconds() - start < length) {
++		ssize_t got = recv(fd, buffer, sizeof(buffer), 0);
++
++		if (got >= (ssize_t)sizeof(struct kern_event_msg)) {
++			struct kern_event_msg *message = (struct kern_event_msg *)buffer;
++
++			if (message->event_code < 256) {
++				counts[message->event_code]++;
++				sizes[message->event_code] = message->total_size;
++			}
++		} else {
++			usleep(100000);
++		}
++	}
++	for (unsigned code = 0; code < 256; code++) {
++		if (counts[code] != 0) {
++			printf("net_test: kev: event %u: %u times, %u bytes in all\n", code, counts[code], sizes[code]);
++		}
++	}
++	printf("net_test: kev: %.0f s listened\n", length);
++	close(fd);
++}
++
++/* ---- gestalt ------------------------------------------------------------------------------------------ */
++
++/* EXP-0234: what MobileGestalt says of the screen: a wide-gamut one makes WebKit draw its tiles in 10-bit surfaces we do not have */
++static void
++gestalt_look(void)
++{
++	void *handle = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
++	CFTypeRef (*copy)(CFStringRef) = handle ? (CFTypeRef (*)(CFStringRef))dlsym(handle, "MGCopyAnswer") : NULL;
++	const char *keys[] = { "HasExtendedColorDisplay", "main-screen-scale", "main-screen-width", "main-screen-height", "DeviceSupportsP3", "ArtworkDeviceSubType" };
++
++	if (copy == NULL) {
++		printf("net_test: gestalt: no MGCopyAnswer\n");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++		CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
++		CFTypeRef answer = copy(key);
++		NSString *text = answer ? [(__bridge id)answer description] : @"(none)";
++
++		printf("net_test: gestalt: %s = %s\n", keys[i], text.UTF8String);
++		if (answer) {
++			CFRelease(answer);
++		}
++		CFRelease(key);
++	}
++}
++
++/* ---- samples ------------------------------------------------------------------------------------------ */
++
++/*
++ * EXP-0235: where the threads of a hung program stand, as sample(1) shows it: the registers of each thread of every process whose
++ * name has one of the NEEDLES, and the frame-pointer chain behind them; each address named by dladdr() here -- the shared cache is at
++ * the same address in every process. Each process is looked at at most three times.
++ */
++extern kern_return_t task_read_for_pid(mach_port_t target, int pid, mach_port_t *task);
++extern kern_return_t task_inspect_for_pid(mach_port_t target, int pid, mach_port_t *task);
++
++static void
++sample_one(pid_t pid, const char *comm)
++{
++	task_t task = MACH_PORT_NULL;
++	thread_act_array_t threads = NULL;
++	mach_msg_type_number_t count = 0;
++	kern_return_t kr, results[3];
++	const char *kinds[3] = { "task_for_pid", "task_read_for_pid", "task_inspect_for_pid" };
++	unsigned kind;
++
++	for (kind = 0; kind < 3; kind++) {
++		task = MACH_PORT_NULL;
++		/*
++		 * EXP-0235 e: the read port only. With cs_relax_platform_task_ports=1 a control port of another task would get through
++		 * task_for_pid, and using it without Developer Mode panics the kernel (task_conversion_eval_internal, ipc_tt.c).
++		 */
++		if (kind == 0) {
++			results[kind] = KERN_NOT_SUPPORTED;
++			continue;
++		}
++		kr = kind == 1 ? task_read_for_pid(mach_task_self(), pid, &task) : task_inspect_for_pid(mach_task_self(), pid, &task);
++		results[kind] = kr;
++		if (kr == KERN_SUCCESS && task != MACH_PORT_NULL) {
++			kr = task_threads(task, &threads, &count);
++			results[kind] = kr == KERN_SUCCESS ? 0 : kr;
++			if (kr == KERN_SUCCESS) {
++				break;
++			}
++		}
++	}
++	if (kind == 3) {
++		printf("net_test: sample %s[%d]: no way in: %s %d, %s %d, %s %d\n", comm, pid, kinds[0], results[0], kinds[1], results[1], kinds[2],
++		    results[2]);
++		return;
++	}
++	{
++		/* EXP-0235 d: a task or thread suspended by RunningBoard shows as a nonzero suspend count -- the one guess that needs no registers */
++		struct task_basic_info_64 tbi;
++		mach_msg_type_number_t tbi_count = TASK_BASIC_INFO_64_COUNT;
++		kern_return_t tkr = task_info(task, TASK_BASIC_INFO_64, (task_info_t)&tbi, &tbi_count);
++
++		printf("net_test: sample %s[%d]: through %s, task_info %d, task suspend %d, %u threads\n", comm, pid, kinds[kind], tkr,
++		    tkr == KERN_SUCCESS ? tbi.suspend_count : -1, count);
++	}
++	for (mach_msg_type_number_t t = 0; t < count; t++) {
++		arm_thread_state64_t state;
++		mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
++		thread_basic_info_data_t basic;
++		mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
++		uint64_t frames[14];
++		unsigned n = 0;
++		char line[1600];
++		size_t used;
++		uint64_t fp;
++
++		kern_return_t skr, ikr;
++
++		memset(&basic, 0, sizeof(basic));
++		ikr = thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &basic_count);
++		skr = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &state_count);
++		if (skr != KERN_SUCCESS) {
++			printf("net_test: sample %s[%d] thread %u: no registers (%d); info %d run %d suspend %d sleep %ds cpu %d%% flags %#x\n", comm, pid,
++			    t, skr, ikr, basic.run_state, basic.suspend_count, basic.sleep_time, basic.cpu_usage / 10, basic.flags);
++			mach_port_deallocate(mach_task_self(), threads[t]);
++			continue;
++		}
++		frames[n++] = state.__pc;
++		frames[n++] = state.__lr;
++		fp = state.__fp;
++		while (n < 14 && fp != 0 && (fp & 7) == 0) {
++			uint64_t pair[2];
++			vm_size_t got = 0;
++
++			if (vm_read_overwrite(task, (vm_address_t)fp, sizeof(pair), (vm_address_t)pair, &got) != KERN_SUCCESS || got != sizeof(pair) ||
++			    pair[1] == 0) {
++				break;
++			}
++			frames[n++] = pair[1];
++			if (pair[0] <= fp) {
++				break;
++			}
++			fp = pair[0];
++		}
++		used = (size_t)snprintf(line, sizeof(line), "net_test: sample %s[%d] thread %u (state %d, suspend %d, sleep %ds, cpu %d%%):", comm, pid, t,
++		    basic.run_state, basic.suspend_count, basic.sleep_time, basic.cpu_usage / 10);
++		for (unsigned i = 0; i < n && used < sizeof(line) - 120; i++) {
++			Dl_info info;
++
++			if (dladdr((void *)frames[i], &info) && info.dli_sname != NULL && strcmp(info.dli_sname, "<redacted>") != 0) {
++				const char *lib = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
++
++				used += (size_t)snprintf(line + used, sizeof(line) - used, " %s(%s)+%llu", info.dli_sname, lib ? lib + 1 : "?",
++				    (unsigned long long)(frames[i] - (uint64_t)info.dli_saddr));
++			} else if (info.dli_fbase != NULL) {
++				/* EXP-0235 f: a redacted name as library + offset from its Mach-O header, for naming it offline from the dyld cache */
++				const char *lib = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
++
++				used += (size_t)snprintf(line + used, sizeof(line) - used, " %s+%#llx", lib ? lib + 1 : "?",
++				    (unsigned long long)(frames[i] - (uint64_t)info.dli_fbase));
++			} else {
++				used += (size_t)snprintf(line + used, sizeof(line) - used, " %#llx", (unsigned long long)frames[i]);
++			}
++		}
++		printf("%s\n", line);
++		mach_port_deallocate(mach_task_self(), threads[t]);
++	}
++	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
++	mach_port_deallocate(mach_task_self(), task);
++}
++
++static void
++samples_look(unsigned rounds, double interval)
++{
++	static const char *const needles[] = { "WebKi", "WebContent", "MobileSafari", "GPU", "Networking" };
++	struct { pid_t pid; unsigned looked; } seen[64] = { { 0, 0 } };
++	int safari_round = -1;
++
++	for (unsigned round = 0; round < rounds; round++) {
++		int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
++		size_t size = 0;
++		struct kinfo_proc *list;
++
++		usleep((useconds_t)(interval * 1e6));
++		if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || (list = malloc(size)) == NULL) {
++			continue;
++		}
++		if (sysctl(mib, 3, list, &size, NULL, 0) == 0) {
++			for (size_t i = 0; i < size / sizeof(*list); i++) {
++				const char *comm = list[i].kp_proc.p_comm;
++				pid_t pid = list[i].kp_proc.p_pid;
++
++				for (unsigned k = 0; k < sizeof(needles) / sizeof(needles[0]); k++) {
++					unsigned slot;
++
++					if (strstr(comm, needles[k]) == NULL) {
++						continue;
++					}
++					if (safari_round < 0 && strstr(comm, "MobileSafari") != NULL) {
++						safari_round = (int)round;
++					}
++					for (slot = 0; slot < 64 && seen[slot].pid != 0 && seen[slot].pid != pid; slot++) {
++					}
++					if (slot < 64 && seen[slot].looked < 3) {
++						seen[slot].pid = pid;
++						/* the first look is at once, the others a few rounds apart, so that a hang shows as the same place twice */
++						if (seen[slot].looked == 0 || round % 3 == 0) {
++							seen[slot].looked++;
++							sample_one(pid, comm);
++						}
++					}
++				}
++			}
++		}
++		/* EXP-0235 f: about 60 s after Safari shows, every process once -- the one Safari waits on is somewhere among them */
++		if (safari_round >= 0 && (int)round == safari_round + 4) {
++			printf("net_test: sample all: begin\n");
++			for (size_t i = 0; i < size / sizeof(*list); i++) {
++				pid_t pid = list[i].kp_proc.p_pid;
++
++				if (pid > 0 && pid != getpid()) {
++					sample_one(pid, list[i].kp_proc.p_comm);
++				}
++			}
++			printf("net_test: sample all: end\n");
++		}
++		free(list);
++	}
++}
++
++/* ---- restartconfd ------------------------------------------------------------------------------------- */
++
++/*
++ * EXP-0220: configd starts about 160 s before the Mi 8's radio (en0) shows up, and does not make a network
++ * service for an interface that comes later [guess]. This ends configd; launchd starts it again when anything
++ * asks for it, and it reads the interfaces afresh. Only for finding out; the real fix is for the radio to be
++ * there when configd starts, or for configd to be told.
++ */
++static void
++restartconfd(void)
++{
++	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
++	size_t size = 0;
++	struct kinfo_proc *list;
++	int killed = 0;
++	double start = seconds();
++
++	while (if_nametoindex("en0") == 0 && seconds() - start < 400) {
++		usleep(500000);
++	}
++	printf("net_test: restartconfd: en0 %s after %.1f s\n", if_nametoindex("en0") ? "is there" : "NOT there", seconds() - start);
++	sleep(5);
++	if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || (list = malloc(size)) == NULL) {
++		printf("net_test: restartconfd: no process list\n");
++		return;
++	}
++	if (sysctl(mib, 3, list, &size, NULL, 0) == 0) {
++		for (size_t i = 0; i < size / sizeof(*list); i++) {
++			if (strcmp(list[i].kp_proc.p_comm, "configd") == 0 && kill(list[i].kp_proc.p_pid, SIGTERM) == 0) {
++				printf("net_test: restartconfd: configd %d ended\n", list[i].kp_proc.p_pid);
++				killed++;
++			}
++		}
++	}
++	free(list);
++	if (killed == 0) {
++		printf("net_test: restartconfd: no configd found\n");
++	}
++}
++
+ /* ---- watch ------------------------------------------------------------------------------------------ */
+ 
+ static double watch_start;
+@@ -548,6 +895,7 @@ wrongjoin(void)
+ int
+ main(int argc, char **argv)
+ {
++	setvbuf(stdout, NULL, _IOLBF, 0);      /* the console is not a terminal: without this the lines wait for the process to end */
+ 	setvbuf(stdout, NULL, _IOLBF, 0);
+ 	@autoreleasepool {
+ 		for (int i = 1; i < argc; i++) {
+@@ -582,6 +930,18 @@ main(int argc, char **argv)
+ 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
+ 			} else if (strcmp(step, "wifi") == 0) {
+ 				wifi();
++			} else if (strcmp(step, "samples") == 0 && i + 2 < argc) {
++				unsigned rounds = (unsigned)atoi(argv[++i]);
++
++				samples_look(rounds, atof(argv[++i]));
++			} else if (strcmp(step, "gestalt") == 0) {
++				gestalt_look();
++			} else if (strcmp(step, "kev") == 0 && i + 1 < argc) {
++				kev_look(atof(argv[++i]));
++			} else if (strcmp(step, "path") == 0 && i + 1 < argc) {
++				path_look(atof(argv[++i]));
++			} else if (strcmp(step, "restartconfd") == 0) {
++				restartconfd();
+ 			} else if (strcmp(step, "watch") == 0 && i + 1 < argc) {
+ 				watch(atof(argv[++i]));
+ 			} else if (strcmp(step, "wrongjoin") == 0) {
+diff --git a/userland/src/redwood_gl.h b/userland/src/redwood_gl.h
+index 4ba8ab5c7cff9a804dc70167ef8627e820f11faa..ecf4c1a08cc13c93ea2f97aa5af5d8e2ef35a718 100644
+--- a/userland/src/redwood_gl.h
++++ b/userland/src/redwood_gl.h
+@@ -19,6 +19,10 @@ const char *redwood_gl_library(void);                           /* for the log *
+  * done; the texture is to be filled and read back with OpenGL ES calls.
+  */
+ int redwood_gl_surface_texture(struct redwood_gl *gl, uint32_t surface);
++/* Texture-object sampling state: 0 identity, 1 RGBA bytes, 2 opacity/blue/green/red bytes.
++ * Capability includes a two-object set/get/rebind check in the current context. */
++int redwood_gl_swizzle_supported(struct redwood_gl *gl);
++int redwood_gl_surface_swizzle(struct redwood_gl *gl, unsigned kind);
+ 
+ /*
+  * CoreAnimation draws a layer's pixels with one of ninety "functions" (a fragment shader each); these
+diff --git a/userland/src/rwtouch.c b/userland/src/rwtouch.c
+index 89c374c33f2e9ac87dfa7e1be16d34baf4221b8a..b5a3d1b1ce2744712664fd62f3362080cdf9d765 100644
+--- a/userland/src/rwtouch.c
++++ b/userland/src/rwtouch.c
+@@ -18,6 +18,8 @@
+  *   button NAME [MS]             press a button: home, lock, volup, voldown
+  *   read                         print the samples that arrive, forever (to watch the queue)
+  *   notify NAME                  post a Darwin notification (com.redwood.unlock: see inject_sb.c)
++ *   mark NAME                    write a monotonic microsecond scene marker
++ *   mem NAME                     report physical memory and VM page counters
+  *   clock                        how long short sleeps really take (a check of the kernel's timers)
+  * Positions are fractions of the screen: 0 0 is the top left corner, 1 1 the bottom right.
+  * Example, "swipe up from the bottom edge two minutes after boot":
+@@ -25,6 +27,8 @@
+  */
+ #include <fcntl.h>
+ #include <mach/mach_time.h>
++#include <mach/mach.h>
++#include <sys/sysctl.h>
+ #include <notify.h>
+ #include <pthread.h>
+ #include <sys/qos.h>
+@@ -148,6 +152,37 @@ zigzag(double x, double y0, double y1, int ms, int times, int step_ms)
+ 	post(REDWOOD_TOUCH_UP, x, y0);
+ }
+ 
++/* Failures remain unknown, never zero; no retry or sleep in the probe. */
++static void
++memory_point(const char *name)
++{
++	char values[8][32], line[512];
++	unsigned long long us = mach_absolute_time() * timebase.numer / timebase.denom / 1000;
++	uint64_t memsize = 0;
++	size_t length = sizeof(memsize);
++	vm_statistics64_data_t vm = {0};
++	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++	vm_size_t pagesize = 0;
++	host_t host = mach_host_self();
++	for (unsigned i = 0; i < 8; i++) strcpy(values[i], "?");
++	if (sysctlbyname("hw.memsize", &memsize, &length, NULL, 0) == 0 && length == sizeof(memsize))
++		snprintf(values[0], sizeof(values[0]), "%llu", (unsigned long long)memsize);
++	if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS && count >= HOST_VM_INFO64_COUNT) {
++		uint64_t pages[] = {vm.free_count, vm.active_count, vm.inactive_count,
++		    vm.wire_count, vm.compressor_page_count, vm.purgeable_count};
++		for (unsigned i = 0; i < 6; i++)
++			snprintf(values[i + 1], sizeof(values[i + 1]), "%llu", (unsigned long long)pages[i]);
++	}
++	if (host_page_size(host, &pagesize) == KERN_SUCCESS && pagesize)
++		snprintf(values[7], sizeof(values[7]), "%llu", (unsigned long long)pagesize);
++	mach_port_deallocate(mach_task_self(), host);
++	int n = snprintf(line, sizeof(line),
++	    "tl: mem %llu %s memsize=%s free=%s active=%s inactive=%s wired=%s compressed=%s purgeable=%s pagesize=%s\n",
++	    us, name, values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]);
++	if (n < 0 || (size_t)n >= sizeof(line) || write(STDOUT_FILENO, line, (size_t)n) != n)
++		perror("rwtouch: mem");
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -163,7 +198,25 @@ main(int argc, char **argv)
+ 		const char *step = argv[i];
+ 		int left = argc - i - 1;
+ 
+-		if (strcmp(step, "wait") == 0 && left >= 1) {
++		if ((strcmp(step, "mark") == 0 || strcmp(step, "mem") == 0) && left >= 1) {
++			const char *name = argv[++i];
++			char line[160];
++			if (!*name || strlen(name) > 64 ||
++			    strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") != strlen(name)) {
++				fprintf(stderr, "rwtouch: invalid marker name\n");
++				return 2;
++			}
++			if (strcmp(step, "mem") == 0) {
++				memory_point(name);
++				continue;
++			}
++			unsigned long long us = mach_absolute_time() * timebase.numer / timebase.denom / 1000;
++			int n = snprintf(line, sizeof(line), "tl: mark %llu %s\n", us, name);
++			if (n < 0 || (size_t)n >= sizeof(line) || write(STDOUT_FILENO, line, (size_t)n) != n) {
++				perror("rwtouch: mark");
++				return 1;
++			}
++		} else if (strcmp(step, "wait") == 0 && left >= 1) {
+ 			usleep((useconds_t)(atof(argv[i + 1]) * 1e6));
+ 			i += 1;
+ 		} else if (strcmp(step, "tap") == 0 && left >= 2) {
